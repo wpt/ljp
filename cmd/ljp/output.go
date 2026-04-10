@@ -23,7 +23,9 @@ var htmlTmpl = template.Must(
 
 func makePostWriter(dir string, pretty bool, render bool) func(*lj.Post) error {
 	if dir != "" {
-		os.MkdirAll(dir, 0755)
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			return func(p *lj.Post) error { return err }
+		}
 		ext := ".json"
 		if render {
 			ext = ".html"
