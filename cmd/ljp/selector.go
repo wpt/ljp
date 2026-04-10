@@ -37,6 +37,9 @@ func parseSelector(arg string) (*selector, error) {
 			if err != nil {
 				return nil, err
 			}
+			if from > to {
+				return nil, fmt.Errorf("inverted LJ ID range: @%d-@%d", from, to)
+			}
 			return &selector{kind: selLJIDRange, ljIDs: []int{from, to}}, nil
 		}
 		parts := strings.Split(arg, ",")
@@ -60,6 +63,9 @@ func parseSelector(arg string) (*selector, error) {
 		to, err := strconv.Atoi(strings.TrimSpace(parts[1]))
 		if err != nil {
 			return nil, fmt.Errorf("invalid ordinal range end: %s", parts[1])
+		}
+		if from > to {
+			return nil, fmt.Errorf("inverted ordinal range: %d-%d", from, to)
 		}
 		return &selector{kind: selOrdinalRange, ordinals: []int{from, to}}, nil
 	}
