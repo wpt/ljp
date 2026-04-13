@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sync"
 
 	"github.com/wpt/ljp/pkg/lj"
 )
@@ -98,4 +99,15 @@ func writePost(post *lj.Post, output string, pretty bool, render bool) {
 
 func renderHTML(w io.Writer, post *lj.Post) error {
 	return htmlTmpl.Execute(w, post)
+}
+
+// makeSyncPostWriter wraps makePostWriter with a mutex for concurrent use.
+func makeSyncPostWriter(dir string, pretty bool, render bool) func(*lj.Post) error {
+	inner := makePostWriter(dir, pretty, render)
+	var mu sync.Mutex
+	return func(p *lj.Post) error {
+		mu.Lock()
+		defer mu.Unlock()
+		return inner(p)
+	}
 }

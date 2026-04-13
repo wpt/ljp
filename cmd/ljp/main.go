@@ -9,6 +9,8 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 
 	"github.com/wpt/ljp/pkg/lj"
 )
@@ -21,6 +23,7 @@ func main() {
 	format := flag.String("format", "html", "body format: html, markdown, text")
 	images := flag.String("images", "", "download images to this directory")
 	resume := flag.Bool("resume", false, "skip already downloaded posts (with --dir)")
+	workers := flag.Int("workers", 4, "number of parallel workers (max 8)")
 	render := flag.Bool("render", false, "output as HTML instead of JSON")
 	output := flag.String("o", "", "output file (default: stdout)")
 	dir := flag.String("dir", "", "output directory (one file per post)")
@@ -46,10 +49,18 @@ func main() {
 		fmt.Fprintf(os.Stderr, "  ljp --format markdown news/166511  (body as markdown)\n")
 		fmt.Fprintf(os.Stderr, "  ljp --images ./img news/166511     (download images)\n")
 		fmt.Fprintf(os.Stderr, "  ljp --resume --dir ./posts news   (skip existing)\n")
-		fmt.Fprintf(os.Stderr, "  ljp --render --comments news/166511 (view as HTML)\n\n")
+		fmt.Fprintf(os.Stderr, "  ljp --render --comments news/166511 (view as HTML)\n")
+		fmt.Fprintf(os.Stderr, "  ljp --workers 4 --comments --dir ./posts news (parallel)\n\n")
 		flag.PrintDefaults()
 	}
 	flag.Parse()
+
+	if *workers < 1 {
+		*workers = 1
+	}
+	if *workers > 8 {
+		*workers = 8
+	}
 
 	if flag.NArg() < 1 {
 		flag.Usage()
@@ -115,12 +126,12 @@ func main() {
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 			os.Exit(1)
 		}
-		runSelectionMode(ctx, client, user, sel, *comments, *dir, *pretty, *render)
+		runSelectionMode(ctx, client, user, sel, *comments, *dir, *pretty, *render, *workers)
 		return
 	}
 
 	if id == 0 {
-		runJournalMode(ctx, client, user, *comments, *dir, *pretty, *render)
+		runJournalMode(ctx, client, user, *comments, *dir, *pretty, *render, *workers)
 		return
 	}
 
@@ -145,7 +156,7 @@ func main() {
 	writePost(post, *output, *pretty, *render)
 }
 
-func runSelectionMode(ctx context.Context, client *lj.Client, user string, sel *selector, comments bool, dir string, pretty bool, render bool) {
+func runSelectionMode(ctx context.Context, client *lj.Client, user string, sel *selector, comments bool, dir string, pretty bool, render bool, workers int) {
 	ids, err := resolveLJIDs(ctx, client, user, sel)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
@@ -158,40 +169,136 @@ func runSelectionMode(ctx context.Context, client *lj.Client, user string, sel *
 	}
 
 	fmt.Fprintf(os.Stderr, "Fetching %d posts...\n", len(ids))
-	onPost := makePostWriter(dir, pretty, render)
 
+	// Filter out skipped IDs
+	var filtered []int
 	for _, id := range ids {
 		if client.SkipIDs != nil && client.SkipIDs[id] {
 			fmt.Fprintf(os.Stderr, "Skipping post %d (already exists)\n", id)
 			continue
 		}
+		filtered = append(filtered, id)
+	}
 
-		fmt.Fprintf(os.Stderr, "Fetching post %s/%d...\n", user, id)
-		post, err := lj.ParsePost(ctx, client, user, id)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Warning: post %d: %v\n", id, err)
-			continue
-		}
-
-		if comments {
-			post.Comments, err = lj.ParseComments(ctx, client, user, id)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "Warning: comments for %d: %v\n", id, err)
+	if workers > 1 && len(filtered) > 1 {
+		runParallel(ctx, client, user, filtered, comments, dir, pretty, render, workers)
+	} else {
+		onPost := makePostWriter(dir, pretty, render)
+		for _, id := range filtered {
+			if err := fetchAndWrite(ctx, client, user, id, comments, onPost); err != nil {
+				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+				os.Exit(1)
 			}
-		}
-
-		if err := onPost(post); err != nil {
-			fmt.Fprintf(os.Stderr, "Error writing post: %v\n", err)
-			os.Exit(1)
 		}
 	}
 }
 
-func runJournalMode(ctx context.Context, client *lj.Client, user string, comments bool, dir string, pretty bool, render bool) {
-	onPost := makePostWriter(dir, pretty, render)
-
+func runJournalMode(ctx context.Context, client *lj.Client, user string, comments bool, dir string, pretty bool, render bool, workers int) {
 	fmt.Fprintf(os.Stderr, "Fetching journal %s...\n", user)
+
+	if workers > 1 {
+		// Full index via calendar pages, then parallel fetch
+		ids, err := lj.FetchFullPostIndex(ctx, client, user)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(1)
+		}
+
+		// Filter skipped
+		var filtered []int
+		for _, id := range ids {
+			if client.SkipIDs != nil && client.SkipIDs[id] {
+				fmt.Fprintf(os.Stderr, "Skipping post %d (already exists)\n", id)
+				continue
+			}
+			filtered = append(filtered, id)
+		}
+
+		fmt.Fprintf(os.Stderr, "Fetching %d posts with %d workers...\n", len(filtered), workers)
+		runParallel(ctx, client, user, filtered, comments, dir, pretty, render, workers)
+		return
+	}
+
+	onPost := makePostWriter(dir, pretty, render)
 	if err := lj.ParseJournal(ctx, client, user, comments, onPost); err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		os.Exit(1)
+	}
+}
+
+func fetchAndWrite(ctx context.Context, client *lj.Client, user string, id int, comments bool, onPost func(*lj.Post) error) error {
+	fmt.Fprintf(os.Stderr, "Fetching post %s/%d...\n", user, id)
+	post, err := lj.ParsePost(ctx, client, user, id)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: post %d: %v\n", id, err)
+		return nil // skip post, not fatal
+	}
+
+	if comments {
+		post.Comments, err = lj.ParseComments(ctx, client, user, id)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: comments for %d: %v\n", id, err)
+		}
+	}
+
+	if err := onPost(post); err != nil {
+		return fmt.Errorf("writing post %d: %w", id, err)
+	}
+	return nil
+}
+
+// newWorkerClient creates a new Client with the same config as the original.
+func newWorkerClient(src *lj.Client) *lj.Client {
+	c := lj.NewClient()
+	c.Log = src.Log
+	c.BodyFormat = src.BodyFormat
+	c.ImagesDir = src.ImagesDir
+	c.SkipIDs = src.SkipIDs
+	return c
+}
+
+func runParallel(ctx context.Context, client *lj.Client, user string, ids []int, comments bool, dir string, pretty bool, render bool, workers int) {
+	if workers > len(ids) {
+		workers = len(ids)
+	}
+
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	onPost := makeSyncPostWriter(dir, pretty, render)
+	ch := make(chan int, len(ids))
+	for _, id := range ids {
+		ch <- id
+	}
+	close(ch)
+
+	var done atomic.Int64
+	total := len(ids)
+	var firstErr atomic.Value
+
+	var wg sync.WaitGroup
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		wc := newWorkerClient(client)
+		go func() {
+			defer wg.Done()
+			for id := range ch {
+				if ctx.Err() != nil {
+					return
+				}
+				if err := fetchAndWrite(ctx, wc, user, id, comments, onPost); err != nil {
+					firstErr.CompareAndSwap(nil, err)
+					cancel()
+					return
+				}
+				n := done.Add(1)
+				fmt.Fprintf(os.Stderr, "Progress: %d/%d\n", n, total)
+			}
+		}()
+	}
+	wg.Wait()
+
+	if err, ok := firstErr.Load().(error); ok && err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
 	}

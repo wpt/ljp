@@ -3,8 +3,10 @@ package lj
 import (
 	"context"
 	"fmt"
+	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/PuerkitoBio/goquery"
 )
@@ -105,6 +107,46 @@ func FetchPostIndex(ctx context.Context, client *Client, user string) ([]int, er
 	}
 
 	client.log("Indexed %d posts\n", len(all))
+	return all, nil
+}
+
+// FetchFullPostIndex returns all post IDs by iterating monthly archive pages.
+// This catches old posts that FetchPostIndex misses due to LJ index page limits.
+func FetchFullPostIndex(ctx context.Context, client *Client, user string) ([]int, error) {
+	// First get posts from standard index
+	seen := make(map[int]bool)
+	var all []int
+
+	// Iterate year/month combinations from 1999 (LJ launch) to current year
+	for year := 1999; year <= time.Now().Year(); year++ {
+		for month := 1; month <= 12; month++ {
+			url := fmt.Sprintf(client.baseURL+"/%d/%02d/", user, year, month)
+			client.log("Indexing %d/%02d...\n", year, month)
+
+			resp, err := client.Get(ctx, url)
+			if err != nil {
+				continue // skip months that error
+			}
+
+			ids, err := ParseJournalIndex(resp.Body)
+			resp.Body.Close()
+			if err != nil {
+				continue
+			}
+
+			for _, id := range ids {
+				if !seen[id] {
+					seen[id] = true
+					all = append(all, id)
+				}
+			}
+		}
+	}
+
+	// Sort by ID (chronological)
+	sort.Ints(all)
+
+	client.log("Full index: %d posts\n", len(all))
 	return all, nil
 }
 

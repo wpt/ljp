@@ -134,6 +134,10 @@ func (c *Client) commentsURL(user string, id, page int) string {
 	return fmt.Sprintf(c.baseURL+"/%d.html?view=flat&page=%d&format=light", user, id, page)
 }
 
+func (c *Client) commentsThreadedURL(user string, id, page int) string {
+	return fmt.Sprintf(c.baseURL+"/%d.html?page=%d&format=light", user, id, page)
+}
+
 func (c *Client) journalURL(user string, skip int) string {
 	return fmt.Sprintf(c.baseURL+"/?skip=%d", user, skip)
 }
