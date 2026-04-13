@@ -1,0 +1,41 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{.Title}}</title>
+<style>
+  body { max-width: 720px; margin: 2em auto; padding: 0 1em; font-family: Georgia, serif; line-height: 1.6; color: #222; }
+  h1 { margin-bottom: 0.2em; }
+  .meta { color: #666; font-size: 0.9em; margin-bottom: 1.5em; }
+  .body img { max-width: 100%; height: auto; }
+  .comments { margin-top: 2em; border-top: 1px solid #ccc; padding-top: 1em; }
+  .comment { margin-left: 0; padding: 0.5em 0; border-bottom: 1px solid #eee; }
+  .comment .author { font-weight: bold; }
+  .comment .date { color: #888; font-size: 0.85em; }
+  .comment .body { margin-top: 0.3em; }
+  .children { margin-left: 1.5em; border-left: 2px solid #ddd; padding-left: 0.5em; }
+  .tags { color: #555; font-size: 0.9em; margin-top: 1em; }
+</style>
+</head>
+<body>
+<h1>{{.Title}}</h1>
+<div class="meta">{{.Author}} &mdash; {{.Date}}</div>
+<div class="body">{{.Body | raw}}</div>
+{{if .Tags}}<div class="tags">Tags: {{range $i, $t := .Tags}}{{if $i}}, {{end}}{{$t}}{{end}}</div>{{end}}
+{{if .Comments}}
+<div class="comments">
+<h2>Comments ({{len .Comments}})</h2>
+{{template "commentList" .Comments}}
+</div>
+{{end}}
+</body>
+</html>
+{{define "commentList"}}{{range .}}
+<div class="comment">
+  <span class="author">{{.Author}}</span> <span class="date">{{.Date}}</span>
+  {{if .Subject}}<div><em>{{.Subject}}</em></div>{{end}}
+  <div class="body">{{.Body | raw}}</div>
+  {{if .Children}}<div class="children">{{template "commentList" .Children}}</div>{{end}}
+</div>
+{{end}}{{end}}

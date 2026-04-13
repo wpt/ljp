@@ -96,8 +96,8 @@ func resolveLJIDs(ctx context.Context, client *lj.Client, user string, sel *sele
 	case selLJIDList:
 		return sel.ljIDs, nil
 	case selLJIDRange:
-		fmt.Fprintf(os.Stderr, "Building post index for LJ ID range...\n")
-		index, err := lj.FetchPostIndex(ctx, client, user)
+		fmt.Fprintf(os.Stderr, "Building full post index for LJ ID range...\n")
+		index, err := lj.FetchFullPostIndex(ctx, client, user)
 		if err != nil {
 			return nil, err
 		}

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -135,6 +136,38 @@ func TestParsePostFull(t *testing.T) {
 	}
 }
 
+// testFlatCommentsHTML returns comments in flat view (all bodies, parent=0).
+func testFlatCommentsHTML(page, maxPage int) string {
+	var comments string
+	switch page {
+	case 1:
+		comments = `{"article":"first comment","uname":"user1","dname":"User One","talkid":100,"dtalkid":1000,"parent":0,"level":1,"ctime":"January 1 2020, 12:00:00 UTC","ctime_ts":1577836800,"subject":"","userpic":"","deleted":0,"loaded":1,"thread":1000},{"article":"reply","uname":"user2","dname":"User Two","talkid":101,"dtalkid":1001,"parent":0,"level":1,"ctime":"January 1 2020, 13:00:00 UTC","ctime_ts":1577840400,"subject":"re","userpic":"","deleted":0,"loaded":1,"thread":1001}`
+	default:
+		comments = ""
+	}
+	var pageLinks string
+	for i := 1; i <= maxPage; i++ {
+		pageLinks += fmt.Sprintf(`<a href="?page=%d&format=light">%d</a> `, i, i)
+	}
+	return fmt.Sprintf(`<html><body>%s<script>Site.page = {"replycount":2,"comments":[%s]};</script></body></html>`, pageLinks, comments)
+}
+
+// testThreadedCommentsHTML returns comments in threaded view (parent info, some loaded:0).
+func testThreadedCommentsHTML(page, maxPage int) string {
+	var comments string
+	switch page {
+	case 1:
+		comments = `{"article":"first comment","uname":"user1","dname":"User One","talkid":100,"dtalkid":1000,"parent":0,"level":1,"ctime":"January 1 2020, 12:00:00 UTC","ctime_ts":1577836800,"subject":"","userpic":"","deleted":0,"loaded":1,"thread":1000},{"article":"","uname":"user2","dname":"User Two","talkid":101,"dtalkid":1001,"parent":1000,"level":2,"ctime":"January 1 2020, 13:00:00 UTC","ctime_ts":1577840400,"subject":"re","userpic":"","deleted":0,"loaded":0,"thread":1001}`
+	default:
+		comments = ""
+	}
+	var pageLinks string
+	for i := 1; i <= maxPage; i++ {
+		pageLinks += fmt.Sprintf(`<a href="?page=%d">%d</a> `, i, i)
+	}
+	return fmt.Sprintf(`<html><body>%s<script>Site.page = {"replycount":2,"comments":[%s]};</script></body></html>`, pageLinks, comments)
+}
+
 func TestParseCommentsFull(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		page := 1
@@ -169,6 +202,99 @@ func TestParseCommentsFull(t *testing.T) {
 	}
 	if tree[1].Body != "page two comment" {
 		t.Errorf("root[1] body = %q", tree[1].Body)
+	}
+}
+
+func TestParseCommentsDualView(t *testing.T) {
+	// Flat view: bodies present, parent=0 for all
+	// Threaded view: parent info present, some loaded:0
+	// Result: bodies from flat, tree from threaded
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		query := r.URL.Query()
+		page := 1
+		if p := query.Get("page"); p != "" {
+			fmt.Sscanf(p, "%d", &page)
+		}
+
+		if query.Get("view") == "flat" {
+			fmt.Fprint(w, testFlatCommentsHTML(page, 1))
+		} else {
+			fmt.Fprint(w, testThreadedCommentsHTML(page, 1))
+		}
+	}))
+	defer srv.Close()
+
+	client := newTestClient(srv.URL)
+	client.baseURL = srv.URL + "/%s"
+
+	tree, err := ParseComments(context.Background(), client, "testuser", 12345)
+	if err != nil {
+		t.Fatalf("ParseComments: %v", err)
+	}
+
+	// Root comment should have body from flat + child from threaded parent mapping
+	if len(tree) != 1 {
+		t.Fatalf("roots = %d, want 1 (second is child of first)", len(tree))
+	}
+	if tree[0].Body != "first comment" {
+		t.Errorf("root body = %q, want 'first comment'", tree[0].Body)
+	}
+	if len(tree[0].Children) != 1 {
+		t.Fatalf("root children = %d, want 1", len(tree[0].Children))
+	}
+	if tree[0].Children[0].Body != "reply" {
+		t.Errorf("child body = %q, want 'reply'", tree[0].Children[0].Body)
+	}
+	if tree[0].Children[0].ParentID != 1000 {
+		t.Errorf("child parent_id = %d, want 1000", tree[0].Children[0].ParentID)
+	}
+}
+
+func TestParseCommentsThreadedFails(t *testing.T) {
+	// Flat view works, threaded returns 500 — should still return flat comments
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		query := r.URL.Query()
+		page := 1
+		if p := query.Get("page"); p != "" {
+			fmt.Sscanf(p, "%d", &page)
+		}
+
+		if query.Get("view") == "flat" {
+			fmt.Fprint(w, testFlatCommentsHTML(page, 1))
+		} else {
+			// Threaded view fails
+			w.WriteHeader(500)
+		}
+	}))
+	defer srv.Close()
+
+	client := newTestClient(srv.URL)
+	client.baseURL = srv.URL + "/%s"
+
+	var warnings []string
+	client.Log = func(format string, args ...any) {
+		warnings = append(warnings, fmt.Sprintf(format, args...))
+	}
+
+	tree, err := ParseComments(context.Background(), client, "testuser", 12345)
+	if err != nil {
+		t.Fatalf("ParseComments should not fail: %v", err)
+	}
+
+	// Should return flat comments (all as roots since no parent info)
+	if len(tree) != 2 {
+		t.Fatalf("roots = %d, want 2 (flat, no tree)", len(tree))
+	}
+
+	// Should have logged a warning
+	hasWarning := false
+	for _, w := range warnings {
+		if strings.Contains(w, "threaded view") {
+			hasWarning = true
+		}
+	}
+	if !hasWarning {
+		t.Errorf("expected warning about threaded view failure, got: %v", warnings)
 	}
 }
 
@@ -284,6 +410,105 @@ func TestGetRetryCanceledDuringBackoff(t *testing.T) {
 	}
 	if elapsed > 2*time.Second {
 		t.Errorf("took %v, should have been canceled quickly", elapsed)
+	}
+}
+
+// --- Image download tests ---
+
+func TestDownloadImages(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "image/jpeg")
+		w.Write([]byte("FAKE_IMAGE_DATA"))
+	}))
+	defer srv.Close()
+
+	dir := t.TempDir()
+	client := newTestClient(srv.URL)
+	client.ImagesDir = dir
+
+	html := fmt.Sprintf(`<p>text</p><img src="%s/photo.jpg"><img src="%s/pic.png">`, srv.URL, srv.URL)
+	result := downloadImages(context.Background(), client, html)
+
+	// Check images were downloaded
+	entries, _ := os.ReadDir(dir)
+	if len(entries) != 2 {
+		t.Fatalf("downloaded %d files, want 2", len(entries))
+	}
+
+	// Check src attributes were rewritten to local paths
+	if strings.Contains(result, srv.URL) {
+		t.Errorf("result still contains server URL: %s", result)
+	}
+	if !strings.Contains(result, dir) {
+		t.Errorf("result doesn't contain local dir %s: %s", dir, result)
+	}
+}
+
+func TestDownloadImagesSkipsOnError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(404)
+	}))
+	defer srv.Close()
+
+	dir := t.TempDir()
+	client := newTestClient(srv.URL)
+	client.ImagesDir = dir
+
+	html := fmt.Sprintf(`<img src="%s/missing.jpg">`, srv.URL)
+	result := downloadImages(context.Background(), client, html)
+
+	// Image download failed — src should remain unchanged
+	if !strings.Contains(result, srv.URL) {
+		t.Errorf("expected original URL preserved on error, got: %s", result)
+	}
+}
+
+// --- FindFirstPostID tests ---
+
+func TestFindFirstPostID(t *testing.T) {
+	// Simulate journal where posts exist at IDs >= 200
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != "HEAD" {
+			http.NotFound(w, r)
+			return
+		}
+		// Extract ID from path like /testuser/NNN.html
+		path := r.URL.Path
+		var id int
+		fmt.Sscanf(path, "/testuser/%d.html", &id)
+		if id >= 200 {
+			w.WriteHeader(200)
+		} else {
+			w.WriteHeader(404)
+		}
+	}))
+	defer srv.Close()
+
+	client := newTestClient(srv.URL)
+	client.baseURL = srv.URL + "/%s"
+
+	id, err := FindFirstPostID(context.Background(), client, "testuser")
+	if err != nil {
+		t.Fatalf("FindFirstPostID: %v", err)
+	}
+	// Should find 200 via binary search between 128 and 256
+	if id != 200 {
+		t.Errorf("first post = %d, want 200", id)
+	}
+}
+
+func TestFindFirstPostIDNoPosts(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(404)
+	}))
+	defer srv.Close()
+
+	client := newTestClient(srv.URL)
+	client.baseURL = srv.URL + "/%s"
+
+	_, err := FindFirstPostID(context.Background(), client, "testuser")
+	if err == nil {
+		t.Error("expected error for empty journal")
 	}
 }
 

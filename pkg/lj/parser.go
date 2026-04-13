@@ -98,6 +98,7 @@ func ParsePost(ctx context.Context, client *Client, user string, id int) (*Post,
 }
 
 func ParseComments(ctx context.Context, client *Client, user string, id int) ([]*Comment, error) {
+	// 1. Fetch flat view (all bodies, no parent info)
 	firstComments, maxPage, err := fetchCommentsPage(ctx, client, user, id, 1)
 	if err != nil {
 		return nil, err
@@ -107,12 +108,72 @@ func ParseComments(ctx context.Context, client *Client, user string, id int) ([]
 	for page := 2; page <= maxPage; page++ {
 		comments, _, err := fetchCommentsPage(ctx, client, user, id, page)
 		if err != nil {
-			return nil, fmt.Errorf("page %d: %w", page, err)
+			return nil, fmt.Errorf("flat page %d: %w", page, err)
 		}
 		all = append(all, comments...)
 	}
 
+	// 2. Fetch threaded view (parent info, may have loaded:0)
+	parentMap := make(map[int]int) // dtalkid -> parent dtalkid
+	firstThreaded, maxPageT, err := fetchThreadedPage(ctx, client, user, id, 1)
+	if err != nil {
+		client.log("Warning: threaded view for %d: %v (comments will be flat)\n", id, err)
+	} else {
+		for _, c := range firstThreaded {
+			parentMap[c.DTalkID] = c.Parent
+		}
+		for page := 2; page <= maxPageT; page++ {
+			threaded, _, err := fetchThreadedPage(ctx, client, user, id, page)
+			if err != nil {
+				client.log("Warning: threaded page %d for %d: %v\n", page, id, err)
+				break
+			}
+			for _, c := range threaded {
+				parentMap[c.DTalkID] = c.Parent
+			}
+		}
+	}
+
+	// 3. Merge: apply parent info from threaded to flat comments
+	if len(parentMap) > 0 {
+		for _, c := range all {
+			if p, ok := parentMap[c.ID]; ok {
+				c.ParentID = p
+			}
+		}
+	}
+
 	return BuildCommentTree(all), nil
+}
+
+func fetchThreadedPage(ctx context.Context, client *Client, user string, id, page int) ([]rawComment, int, error) {
+	url := client.commentsThreadedURL(user, id, page)
+	client.log("  threaded page %d...\n", page)
+	resp, err := client.Get(ctx, url)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, 0, err
+	}
+
+	maxPage := 1
+	for _, m := range pageRe.FindAllSubmatch(body, -1) {
+		if n, err := strconv.Atoi(string(m[1])); err == nil && n > maxPage {
+			maxPage = n
+		}
+	}
+
+	sp, err := extractSitePage(body)
+	if err != nil {
+		return nil, 0, err
+	}
+
+	client.log("  threaded page %d: %d comments\n", page, len(sp.Comments))
+	return sp.Comments, maxPage, nil
 }
 
 func fetchCommentsPage(ctx context.Context, client *Client, user string, id, page int) ([]*Comment, int, error) {
