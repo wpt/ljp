@@ -3,7 +3,7 @@ package lj
 import (
 	"context"
 	"fmt"
-	"sort"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -102,9 +102,7 @@ func FetchPostIndex(ctx context.Context, client *Client, user string) ([]int, er
 	}
 
 	// Reverse: LJ returns newest first, we want oldest first
-	for i, j := 0, len(all)-1; i < j; i, j = i+1, j-1 {
-		all[i], all[j] = all[j], all[i]
-	}
+	slices.Reverse(all)
 
 	client.log("Indexed %d posts\n", len(all))
 	return all, nil
@@ -144,7 +142,7 @@ func FetchFullPostIndex(ctx context.Context, client *Client, user string) ([]int
 	}
 
 	// Sort by ID (chronological)
-	sort.Ints(all)
+	slices.Sort(all)
 
 	client.log("Full index: %d posts\n", len(all))
 	return all, nil
