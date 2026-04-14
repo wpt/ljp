@@ -283,7 +283,10 @@ func extractJSON(html []byte) ([]byte, error) {
 
 // downloadImages finds all <img src="..."> in HTML, downloads images, replaces URLs.
 func downloadImages(ctx context.Context, client *Client, html string) string {
-	os.MkdirAll(client.ImagesDir, 0755)
+	if err := os.MkdirAll(client.ImagesDir, 0755); err != nil {
+		client.log("Warning: mkdir %s: %v\n", client.ImagesDir, err)
+		return html
+	}
 
 	doc, err := goquery.NewDocumentFromReader(strings.NewReader("<div>" + html + "</div>"))
 	if err != nil {

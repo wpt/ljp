@@ -55,12 +55,7 @@ func main() {
 	}
 	flag.Parse()
 
-	if *workers < 1 {
-		*workers = 1
-	}
-	if *workers > 8 {
-		*workers = 8
-	}
+	*workers = max(1, min(*workers, 8))
 
 	if flag.NArg() < 1 {
 		flag.Usage()
@@ -149,8 +144,7 @@ func main() {
 			fmt.Fprintf(os.Stderr, "Error fetching comments: %v\n", err)
 			os.Exit(1)
 		}
-		total := countComments(post.Comments)
-		fmt.Fprintf(os.Stderr, "Got %d comments\n", total)
+		fmt.Fprintf(os.Stderr, "Got %d comments\n", lj.CountComments(post.Comments))
 	}
 
 	writePost(post, *output, *pretty, *render)
@@ -170,15 +164,7 @@ func runSelectionMode(ctx context.Context, client *lj.Client, user string, sel *
 
 	fmt.Fprintf(os.Stderr, "Fetching %d posts...\n", len(ids))
 
-	// Filter out skipped IDs
-	var filtered []int
-	for _, id := range ids {
-		if client.SkipIDs != nil && client.SkipIDs[id] {
-			fmt.Fprintf(os.Stderr, "Skipping post %d (already exists)\n", id)
-			continue
-		}
-		filtered = append(filtered, id)
-	}
+	filtered := filterSkipped(ids, client.SkipIDs)
 
 	if workers > 1 && len(filtered) > 1 {
 		runParallel(ctx, client, user, filtered, comments, dir, pretty, render, workers)
@@ -204,15 +190,7 @@ func runJournalMode(ctx context.Context, client *lj.Client, user string, comment
 			os.Exit(1)
 		}
 
-		// Filter skipped
-		var filtered []int
-		for _, id := range ids {
-			if client.SkipIDs != nil && client.SkipIDs[id] {
-				fmt.Fprintf(os.Stderr, "Skipping post %d (already exists)\n", id)
-				continue
-			}
-			filtered = append(filtered, id)
-		}
+		filtered := filterSkipped(ids, client.SkipIDs)
 
 		fmt.Fprintf(os.Stderr, "Fetching %d posts with %d workers...\n", len(filtered), workers)
 		runParallel(ctx, client, user, filtered, comments, dir, pretty, render, workers)
@@ -258,9 +236,7 @@ func newWorkerClient(src *lj.Client) *lj.Client {
 }
 
 func runParallel(ctx context.Context, client *lj.Client, user string, ids []int, comments bool, dir string, pretty bool, render bool, workers int) {
-	if workers > len(ids) {
-		workers = len(ids)
-	}
+	workers = min(workers, len(ids))
 
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -277,7 +253,7 @@ func runParallel(ctx context.Context, client *lj.Client, user string, ids []int,
 	var firstErr atomic.Value
 
 	var wg sync.WaitGroup
-	for i := 0; i < workers; i++ {
+	for range workers {
 		wg.Add(1)
 		wc := newWorkerClient(client)
 		go func() {
@@ -320,12 +296,19 @@ func parseArg(arg string) (string, int, error) {
 	return parts[0], id, nil
 }
 
-func countComments(comments []*lj.Comment) int {
-	n := len(comments)
-	for _, c := range comments {
-		n += countComments(c.Children)
+func filterSkipped(ids []int, skipIDs map[int]bool) []int {
+	if len(skipIDs) == 0 {
+		return ids
 	}
-	return n
+	filtered := make([]int, 0, len(ids))
+	for _, id := range ids {
+		if skipIDs[id] {
+			fmt.Fprintf(os.Stderr, "Skipping post %d (already exists)\n", id)
+			continue
+		}
+		filtered = append(filtered, id)
+	}
+	return filtered
 }
 
 // scanExistingPosts reads a directory for {id}.json files and returns their IDs.

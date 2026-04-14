@@ -1,6 +1,7 @@
 package main
 
 import (
+	"cmp"
 	"embed"
 	"encoding/json"
 	"flag"
@@ -10,7 +11,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
-	"sort"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -77,119 +78,117 @@ func main() {
 	}
 
 	mux.HandleFunc("/post/", func(w http.ResponseWriter, r *http.Request) {
-		idStr := strings.TrimPrefix(r.URL.Path, "/post/")
-		id, err := strconv.Atoi(idStr)
-		if err != nil {
-			http.Error(w, "invalid post ID", 400)
-			return
-		}
-
-		path := filepath.Join(*dir, fmt.Sprintf("%d.json", id))
-		data, err := os.ReadFile(path)
-		if err != nil {
-			http.Error(w, "post not found", 404)
-			return
-		}
-
-		var post lj.Post
-		if err := json.Unmarshal(data, &post); err != nil {
-			http.Error(w, "bad json", 500)
-			return
-		}
-
-		// Rewrite absolute image paths to /images/filename
-		if imagesDir != "" {
-			post.Body = rewriteImagePaths(post.Body, imagesDir)
-		}
-
-		// Build comment tree from flat list
-		if len(post.Comments) > 0 && !hasChildren(post.Comments) {
-			post.Comments = lj.BuildCommentTree(post.Comments)
-		}
-
-		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		postTmpl.Execute(w, &post)
+		handlePost(w, r, *dir, imagesDir)
 	})
 
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/" {
-			http.NotFound(w, r)
-			return
-		}
-
-		entries, err := os.ReadDir(*dir)
-		if err != nil {
-			http.Error(w, err.Error(), 500)
-			return
-		}
-
-		var posts []postEntry
-		for _, e := range entries {
-			name := e.Name()
-			if !strings.HasSuffix(name, ".json") {
-				continue
-			}
-			id, err := strconv.Atoi(strings.TrimSuffix(name, ".json"))
-			if err != nil {
-				continue
-			}
-
-			data, err := os.ReadFile(filepath.Join(*dir, name))
-			if err != nil {
-				continue
-			}
-
-			var p struct {
-				Title    string         `json:"title"`
-				Date     string         `json:"date"`
-				Comments []*lj.Comment  `json:"comments,omitempty"`
-			}
-			if err := json.Unmarshal(data, &p); err != nil {
-				log.Printf("Warning: bad json in %s: %v", name, err)
-				continue
-			}
-
-			posts = append(posts, postEntry{
-				ID:           id,
-				Title:        p.Title,
-				Date:         p.Date,
-				CommentCount: countComments(p.Comments),
-			})
-		}
-
-		sort.Slice(posts, func(i, j int) bool { return posts[i].ID < posts[j].ID })
-
-		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		indexTmpl.Execute(w, struct {
-			User  string
-			Posts []postEntry
-		}{user, posts})
+		handleIndex(w, r, *dir, user)
 	})
 
 	log.Printf("Serving %s on %s", *dir, *addr)
 	log.Fatal(http.ListenAndServe(*addr, mux))
 }
 
-func countComments(comments []*lj.Comment) int {
-	n := len(comments)
-	for _, c := range comments {
-		n += countComments(c.Children)
+func handlePost(w http.ResponseWriter, r *http.Request, dir, imagesDir string) {
+	idStr := strings.TrimPrefix(r.URL.Path, "/post/")
+	id, err := strconv.Atoi(idStr)
+	if err != nil {
+		http.Error(w, "invalid post ID", 400)
+		return
 	}
-	return n
+
+	data, err := os.ReadFile(filepath.Join(dir, fmt.Sprintf("%d.json", id)))
+	if err != nil {
+		http.Error(w, "post not found", 404)
+		return
+	}
+
+	var post lj.Post
+	if err := json.Unmarshal(data, &post); err != nil {
+		log.Printf("Error: bad json in %d.json: %v", id, err)
+		http.Error(w, "bad json", 500)
+		return
+	}
+
+	if imagesDir != "" {
+		post.Body = rewriteImagePaths(post.Body, imagesDir)
+	}
+
+	// Build comment tree from flat list
+	if len(post.Comments) > 0 && !hasChildren(post.Comments) {
+		post.Comments = lj.BuildCommentTree(post.Comments)
+	}
+
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	if err := postTmpl.Execute(w, &post); err != nil {
+		log.Printf("Error: rendering post %d: %v", id, err)
+	}
 }
 
-// hasChildren checks if the comment list is already a tree (has any children).
-func hasChildren(comments []*lj.Comment) bool {
-	for _, c := range comments {
-		if len(c.Children) > 0 {
-			return true
-		}
+func handleIndex(w http.ResponseWriter, r *http.Request, dir, user string) {
+	if r.URL.Path != "/" {
+		http.NotFound(w, r)
+		return
 	}
-	return false
+
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		http.Error(w, err.Error(), 500)
+		return
+	}
+
+	var posts []postEntry
+	for _, e := range entries {
+		name := e.Name()
+		if !strings.HasSuffix(name, ".json") {
+			continue
+		}
+		id, err := strconv.Atoi(strings.TrimSuffix(name, ".json"))
+		if err != nil {
+			continue
+		}
+
+		data, err := os.ReadFile(filepath.Join(dir, name))
+		if err != nil {
+			continue
+		}
+
+		var p struct {
+			Title    string        `json:"title"`
+			Date     string        `json:"date"`
+			Comments []*lj.Comment `json:"comments,omitempty"`
+		}
+		if err := json.Unmarshal(data, &p); err != nil {
+			log.Printf("Warning: bad json in %s: %v", name, err)
+			continue
+		}
+
+		posts = append(posts, postEntry{
+			ID:           id,
+			Title:        p.Title,
+			Date:         p.Date,
+			CommentCount: lj.CountComments(p.Comments),
+		})
+	}
+
+	slices.SortFunc(posts, func(a, b postEntry) int { return cmp.Compare(a.ID, b.ID) })
+
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	if err := indexTmpl.Execute(w, struct {
+		User  string
+		Posts []postEntry
+	}{user, posts}); err != nil {
+		log.Printf("Error: rendering index: %v", err)
+	}
+}
+
+func hasChildren(comments []*lj.Comment) bool {
+	return slices.ContainsFunc(comments, func(c *lj.Comment) bool {
+		return len(c.Children) > 0
+	})
 }
 
 // rewriteImagePaths replaces absolute image paths containing imagesDir with /images/filename.
 func rewriteImagePaths(body, imagesDir string) string {
-	// Replace paths like src="/home/q/galkovsky/images/abc123.jpg" with src="/images/abc123.jpg"
 	return strings.ReplaceAll(body, `src="`+imagesDir+`/`, `src="/images/`)
 }

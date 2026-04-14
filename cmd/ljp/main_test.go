@@ -56,16 +56,16 @@ func TestCountComments(t *testing.T) {
 		},
 		{ID: 5, Body: "root2"},
 	}
-	got := countComments(tree)
+	got := lj.CountComments(tree)
 	if got != 5 {
-		t.Errorf("countComments = %d, want 5", got)
+		t.Errorf("lj.CountComments = %d, want 5", got)
 	}
 }
 
 func TestCountCommentsEmpty(t *testing.T) {
-	got := countComments(nil)
+	got := lj.CountComments(nil)
 	if got != 0 {
-		t.Errorf("countComments(nil) = %d, want 0", got)
+		t.Errorf("lj.CountComments(nil) = %d, want 0", got)
 	}
 }
 

@@ -77,6 +77,15 @@ func BuildCommentTree(flat []*Comment) []*Comment {
 	return roots
 }
 
+// CountComments returns the total number of comments in a tree (including nested children).
+func CountComments(comments []*Comment) int {
+	n := len(comments)
+	for _, c := range comments {
+		n += CountComments(c.Children)
+	}
+	return n
+}
+
 func ParseDate(s string) time.Time {
 	formats := []string{
 		"January 2 2006, 15:04",
