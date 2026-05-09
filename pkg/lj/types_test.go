@@ -50,6 +50,106 @@ func TestBuildCommentTree(t *testing.T) {
 			t.Errorf("expected nil, got %d roots", len(roots))
 		}
 	})
+
+	t.Run("idempotent on duplicate input", func(t *testing.T) {
+		// Simulates LJ's 'last page returns forever' over-fetch: duplicate
+		// comment IDs in the flat list must not produce duplicate children.
+		root := &Comment{ID: 1, ParentID: 0, Body: "root"}
+		child := &Comment{ID: 2, ParentID: 1, Body: "child"}
+		flat := []*Comment{root, child, root, child}
+		roots := BuildCommentTree(flat)
+		if len(roots) != 1 {
+			t.Fatalf("roots = %d, want 1", len(roots))
+		}
+		if len(roots[0].Children) != 1 {
+			t.Fatalf("children = %d, want 1 (duplicates collapsed)", len(roots[0].Children))
+		}
+	})
+
+	t.Run("idempotent on re-run", func(t *testing.T) {
+		// Calling BuildCommentTree twice on the same slice must not double-append.
+		flat := []*Comment{
+			{ID: 1, ParentID: 0},
+			{ID: 2, ParentID: 1},
+		}
+		_ = BuildCommentTree(flat)
+		roots := BuildCommentTree(flat)
+		if len(roots) != 1 || len(roots[0].Children) != 1 {
+			t.Fatalf("second build: roots=%d children=%d, want 1/1", len(roots), len(roots[0].Children))
+		}
+	})
+
+	t.Run("self-parent treated as root", func(t *testing.T) {
+		flat := []*Comment{{ID: 5, ParentID: 5, Body: "self"}}
+		roots := BuildCommentTree(flat)
+		if len(roots) != 1 || roots[0].ID != 5 {
+			t.Fatalf("expected single self-root, got %+v", roots)
+		}
+	})
+
+	t.Run("parent cycle does not drop comments or loop", func(t *testing.T) {
+		// A↔B mutual-parent cycle: both must survive as roots and the tree must
+		// be acyclic (CountComments must terminate and count both).
+		flat := []*Comment{
+			{ID: 1, ParentID: 2, Body: "A"},
+			{ID: 2, ParentID: 1, Body: "B"},
+		}
+		roots := BuildCommentTree(flat)
+		if len(roots) != 2 {
+			t.Fatalf("roots = %d, want 2 (cycle members promoted to roots)", len(roots))
+		}
+		if n := CountComments(roots); n != 2 {
+			t.Errorf("CountComments = %d, want 2", n)
+		}
+		// Neither may list the other as a child (that would re-form the cycle).
+		for _, r := range roots {
+			if len(r.Children) != 0 {
+				t.Errorf("root %d has %d children, want 0 (cycle broken)", r.ID, len(r.Children))
+			}
+		}
+	})
+}
+
+func TestCountCommentsCycleSafe(t *testing.T) {
+	// Build a cyclic tree directly (bypass BuildCommentTree) and confirm
+	// CountComments terminates and does not stack-overflow.
+	a := &Comment{ID: 1}
+	b := &Comment{ID: 2}
+	a.Children = []*Comment{b}
+	b.Children = []*Comment{a} // cycle
+	n := CountComments([]*Comment{a})
+	if n != 2 {
+		t.Errorf("CountComments on cyclic tree = %d, want 2", n)
+	}
+}
+
+func TestCountComments(t *testing.T) {
+	tree := []*Comment{
+		{
+			ID:   1,
+			Body: "root",
+			Children: []*Comment{
+				{ID: 2, Body: "child1"},
+				{
+					ID:   3,
+					Body: "child2",
+					Children: []*Comment{
+						{ID: 4, Body: "grandchild"},
+					},
+				},
+			},
+		},
+		{ID: 5, Body: "root2"},
+	}
+	if got := CountComments(tree); got != 5 {
+		t.Errorf("CountComments = %d, want 5", got)
+	}
+}
+
+func TestCountCommentsEmpty(t *testing.T) {
+	if got := CountComments(nil); got != 0 {
+		t.Errorf("CountComments(nil) = %d, want 0", got)
+	}
 }
 
 func TestParseDate(t *testing.T) {
