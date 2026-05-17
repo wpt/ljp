@@ -2,117 +2,44 @@ package lj
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
-
-	"golang.org/x/time/rate"
 )
 
-const testPostHTML = `<!DOCTYPE html>
-<html><head>
-<meta property="og:title" content="Test Post"/>
-<meta property="og:description" content="A test"/>
-<meta property="og:image" content="http://example.com/img.jpg"/>
-</head><body>
-<h1 class="aentry-post__title">Test Post Title</h1>
-<time>January 15 2020, 10:30</time>
-<div class="aentry-post__text aentry-post__text--view">
-<p>Hello world</p>
-</div>
-<a href="/tag/test">test</a>
-<a href="/tag/go">go</a>
-</body></html>`
-
-func testCommentsHTML(page, maxPage int) string {
-	var comments string
-	switch page {
-	case 1:
-		comments = `{"article":"first comment","uname":"user1","dname":"User One","talkid":100,"dtalkid":1000,"parent":0,"level":1,"ctime":"January 1 2020, 12:00:00 UTC","ctime_ts":1577836800,"subject":"","userpic":"","deleted":0,"loaded":1,"thread":1000},{"article":"reply","uname":"user2","dname":"User Two","talkid":101,"dtalkid":1001,"parent":1000,"level":2,"ctime":"January 1 2020, 13:00:00 UTC","ctime_ts":1577840400,"subject":"re","userpic":"","deleted":0,"loaded":1,"thread":1001}`
-	case 2:
-		comments = `{"article":"page two comment","uname":"user3","dname":"User Three","talkid":200,"dtalkid":2000,"parent":0,"level":1,"ctime":"January 2 2020, 10:00:00 UTC","ctime_ts":1577959200,"subject":"","userpic":"","deleted":0,"loaded":1,"thread":2000}`
-	default:
-		comments = ""
-	}
-
-	var pageLinks string
-	for i := 1; i <= maxPage; i++ {
-		pageLinks += fmt.Sprintf(`<a href="?page=%d&format=light">%d</a> `, i, i)
-	}
-
-	return fmt.Sprintf(`<html><body>%s<script>Site.page = {"replycount":3,"comments":[%s]};</script></body></html>`, pageLinks, comments)
-}
-
-// newTestClient creates a client pointing at the test server.
-func newTestClient(serverURL string) *Client {
-	return &Client{
-		http:         http.DefaultClient,
-		limiter:      rate.NewLimiter(rate.Inf, 1),
-		baseURL:      serverURL,
-		retryBackoff: time.Millisecond,
-	}
-}
-
-func setupTestServer(maxPage int) *httptest.Server {
-	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		path := r.URL.Path
-		query := r.URL.Query()
-
-		if query.Get("format") == "light" {
-			page := 1
-			if p := query.Get("page"); p != "" {
-				fmt.Sscanf(p, "%d", &page)
-			}
-			fmt.Fprint(w, testCommentsHTML(page, maxPage))
-			return
-		}
-
-		if path == "/12345.html" {
-			fmt.Fprint(w, testPostHTML)
-			return
-		}
-
-		http.NotFound(w, r)
-	}))
-}
+// Shared helpers (testPostHTML, testCommentsHTML, newTestClient, queryPage)
+// live in testhelpers_test.go.
 
 func TestParsePostFull(t *testing.T) {
-	srv := setupTestServer(1)
-	defer srv.Close()
-
-	client := newTestClient(srv.URL)
-	// baseURL has no %s, so user param is ignored in URL building
-	// postURL will produce: http://127.0.0.1:PORT/12345.html (with "testuser" ignored since no %s)
-	// We need baseURL to include %s pattern. Let's use a fixed approach instead.
-	client.baseURL = srv.URL + "/%s" // will produce srv.URL + "/testuser" but server ignores path prefix
-
-	// Actually simpler: make the server match any .html path
-	srv2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		query := r.URL.Query()
 		if query.Get("format") == "light" {
 			page := 1
 			if p := query.Get("page"); p != "" {
-				fmt.Sscanf(p, "%d", &page)
+				if n, err := strconv.Atoi(p); err == nil {
+					page = n
+				}
 			}
 			fmt.Fprint(w, testCommentsHTML(page, 2))
 			return
 		}
 		fmt.Fprint(w, testPostHTML)
 	}))
-	defer srv2.Close()
+	defer srv.Close()
 
-	client2 := newTestClient(srv2.URL)
-	// baseURL format: "http://host/%s" so postURL("user", 12345) => "http://host/user/12345.html"
-	// But our server doesn't care about the path, it serves testPostHTML for everything non-light
-	client2.baseURL = srv2.URL + "/%s"
+	client := newTestClient(srv.URL)
+	client.baseURL = srv.URL + "/%s"
 
 	ctx := context.Background()
-	post, err := ParsePost(ctx, client2, "testuser", 12345)
+	post, err := ParsePost(ctx, client, "testuser", 12345)
 	if err != nil {
 		t.Fatalf("ParsePost: %v", err)
 	}
@@ -136,44 +63,9 @@ func TestParsePostFull(t *testing.T) {
 	}
 }
 
-// testFlatCommentsHTML returns comments in flat view (all bodies, parent=0).
-func testFlatCommentsHTML(page, maxPage int) string {
-	var comments string
-	switch page {
-	case 1:
-		comments = `{"article":"first comment","uname":"user1","dname":"User One","talkid":100,"dtalkid":1000,"parent":0,"level":1,"ctime":"January 1 2020, 12:00:00 UTC","ctime_ts":1577836800,"subject":"","userpic":"","deleted":0,"loaded":1,"thread":1000},{"article":"reply","uname":"user2","dname":"User Two","talkid":101,"dtalkid":1001,"parent":0,"level":1,"ctime":"January 1 2020, 13:00:00 UTC","ctime_ts":1577840400,"subject":"re","userpic":"","deleted":0,"loaded":1,"thread":1001}`
-	default:
-		comments = ""
-	}
-	var pageLinks string
-	for i := 1; i <= maxPage; i++ {
-		pageLinks += fmt.Sprintf(`<a href="?page=%d&format=light">%d</a> `, i, i)
-	}
-	return fmt.Sprintf(`<html><body>%s<script>Site.page = {"replycount":2,"comments":[%s]};</script></body></html>`, pageLinks, comments)
-}
-
-// testThreadedCommentsHTML returns comments in threaded view (parent info, some loaded:0).
-func testThreadedCommentsHTML(page, maxPage int) string {
-	var comments string
-	switch page {
-	case 1:
-		comments = `{"article":"first comment","uname":"user1","dname":"User One","talkid":100,"dtalkid":1000,"parent":0,"level":1,"ctime":"January 1 2020, 12:00:00 UTC","ctime_ts":1577836800,"subject":"","userpic":"","deleted":0,"loaded":1,"thread":1000},{"article":"","uname":"user2","dname":"User Two","talkid":101,"dtalkid":1001,"parent":1000,"level":2,"ctime":"January 1 2020, 13:00:00 UTC","ctime_ts":1577840400,"subject":"re","userpic":"","deleted":0,"loaded":0,"thread":1001}`
-	default:
-		comments = ""
-	}
-	var pageLinks string
-	for i := 1; i <= maxPage; i++ {
-		pageLinks += fmt.Sprintf(`<a href="?page=%d">%d</a> `, i, i)
-	}
-	return fmt.Sprintf(`<html><body>%s<script>Site.page = {"replycount":2,"comments":[%s]};</script></body></html>`, pageLinks, comments)
-}
-
 func TestParseCommentsFull(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		page := 1
-		if p := r.URL.Query().Get("page"); p != "" {
-			fmt.Sscanf(p, "%d", &page)
-		}
+		page := queryPage(r)
 		fmt.Fprint(w, testCommentsHTML(page, 2))
 	}))
 	defer srv.Close()
@@ -200,27 +92,34 @@ func TestParseCommentsFull(t *testing.T) {
 	if tree[0].Children[0].Body != "reply" {
 		t.Errorf("child body = %q", tree[0].Children[0].Body)
 	}
+	// Flat view supplies parent IDs directly — confirm the reply links back.
+	if tree[0].Children[0].ParentID != 1000 {
+		t.Errorf("child parent_id = %d, want 1000", tree[0].Children[0].ParentID)
+	}
+	// Pin the Level and DateUnix mapping from Site.page JSON so a regression in
+	// fetchCommentsPage's field mapping is caught.
+	if tree[0].Level != 1 {
+		t.Errorf("root level = %d, want 1", tree[0].Level)
+	}
+	if tree[0].Children[0].Level != 2 {
+		t.Errorf("child level = %d, want 2", tree[0].Children[0].Level)
+	}
+	if tree[0].DateUnix != 1577836800 {
+		t.Errorf("root date_unix = %d, want 1577836800", tree[0].DateUnix)
+	}
 	if tree[1].Body != "page two comment" {
 		t.Errorf("root[1] body = %q", tree[1].Body)
 	}
 }
 
-func TestParseCommentsDualView(t *testing.T) {
-	// Flat view: bodies present, parent=0 for all
-	// Threaded view: parent info present, some loaded:0
-	// Result: bodies from flat, tree from threaded
+// TestParseCommentsDeduplicatesOverfetch simulates LJ's 'returns last page
+// forever' quirk: the server claims maxPage=3 but returns the same payload
+// for every page request. Without dedupe in BuildCommentTree the tree would
+// have triple-counted comments. The test pins the idempotency contract.
+func TestParseCommentsDeduplicatesOverfetch(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		query := r.URL.Query()
-		page := 1
-		if p := query.Get("page"); p != "" {
-			fmt.Sscanf(p, "%d", &page)
-		}
-
-		if query.Get("view") == "flat" {
-			fmt.Fprint(w, testFlatCommentsHTML(page, 1))
-		} else {
-			fmt.Fprint(w, testThreadedCommentsHTML(page, 1))
-		}
+		// Always return page 1 payload, regardless of which page was requested.
+		fmt.Fprint(w, testCommentsHTML(1, 3))
 	}))
 	defer srv.Close()
 
@@ -231,70 +130,11 @@ func TestParseCommentsDualView(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ParseComments: %v", err)
 	}
-
-	// Root comment should have body from flat + child from threaded parent mapping
 	if len(tree) != 1 {
-		t.Fatalf("roots = %d, want 1 (second is child of first)", len(tree))
-	}
-	if tree[0].Body != "first comment" {
-		t.Errorf("root body = %q, want 'first comment'", tree[0].Body)
+		t.Fatalf("roots = %d, want 1 (duplicates collapsed)", len(tree))
 	}
 	if len(tree[0].Children) != 1 {
-		t.Fatalf("root children = %d, want 1", len(tree[0].Children))
-	}
-	if tree[0].Children[0].Body != "reply" {
-		t.Errorf("child body = %q, want 'reply'", tree[0].Children[0].Body)
-	}
-	if tree[0].Children[0].ParentID != 1000 {
-		t.Errorf("child parent_id = %d, want 1000", tree[0].Children[0].ParentID)
-	}
-}
-
-func TestParseCommentsThreadedFails(t *testing.T) {
-	// Flat view works, threaded returns 500 — should still return flat comments
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		query := r.URL.Query()
-		page := 1
-		if p := query.Get("page"); p != "" {
-			fmt.Sscanf(p, "%d", &page)
-		}
-
-		if query.Get("view") == "flat" {
-			fmt.Fprint(w, testFlatCommentsHTML(page, 1))
-		} else {
-			// Threaded view fails
-			w.WriteHeader(500)
-		}
-	}))
-	defer srv.Close()
-
-	client := newTestClient(srv.URL)
-	client.baseURL = srv.URL + "/%s"
-
-	var warnings []string
-	client.Log = func(format string, args ...any) {
-		warnings = append(warnings, fmt.Sprintf(format, args...))
-	}
-
-	tree, err := ParseComments(context.Background(), client, "testuser", 12345)
-	if err != nil {
-		t.Fatalf("ParseComments should not fail: %v", err)
-	}
-
-	// Should return flat comments (all as roots since no parent info)
-	if len(tree) != 2 {
-		t.Fatalf("roots = %d, want 2 (flat, no tree)", len(tree))
-	}
-
-	// Should have logged a warning
-	hasWarning := false
-	for _, w := range warnings {
-		if strings.Contains(w, "threaded view") {
-			hasWarning = true
-		}
-	}
-	if !hasWarning {
-		t.Errorf("expected warning about threaded view failure, got: %v", warnings)
+		t.Fatalf("children = %d, want 1 (duplicates collapsed)", len(tree[0].Children))
 	}
 }
 
@@ -321,7 +161,10 @@ func TestClientGetCanceled(t *testing.T) {
 
 	_, err := client.Get(ctx, srv.URL+"/")
 	if err == nil {
-		t.Error("expected error for canceled context")
+		t.Fatal("expected error for canceled context")
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("expected context.Canceled, got %v", err)
 	}
 }
 
@@ -429,18 +272,112 @@ func TestDownloadImages(t *testing.T) {
 	html := fmt.Sprintf(`<p>text</p><img src="%s/photo.jpg"><img src="%s/pic.png">`, srv.URL, srv.URL)
 	result := downloadImages(context.Background(), client, html)
 
-	// Check images were downloaded
 	entries, _ := os.ReadDir(dir)
 	if len(entries) != 2 {
 		t.Fatalf("downloaded %d files, want 2", len(entries))
 	}
 
-	// Check src attributes were rewritten to local paths
 	if strings.Contains(result, srv.URL) {
 		t.Errorf("result still contains server URL: %s", result)
 	}
-	if !strings.Contains(result, dir) {
-		t.Errorf("result doesn't contain local dir %s: %s", dir, result)
+	// HTML always uses forward slashes; on Windows TempDir gives backslashes.
+	wantDir := filepath.ToSlash(dir)
+	if !strings.Contains(result, wantDir) {
+		t.Errorf("result missing local dir %s: %s", wantDir, result)
+	}
+}
+
+func TestDownloadImagesContentTypeFixesExtension(t *testing.T) {
+	// Extension-less URL: server says it's a PNG, so the file (and the rewritten
+	// src) should end in .png, not the default .jpg fallback.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "image/png")
+		w.Write([]byte("FAKE_PNG"))
+	}))
+	defer srv.Close()
+
+	dir := t.TempDir()
+	client := newTestClient(srv.URL)
+	client.ImagesDir = dir
+
+	html := fmt.Sprintf(`<img src="%s/image?id=42">`, srv.URL)
+	result := downloadImages(context.Background(), client, html)
+
+	entries, _ := os.ReadDir(dir)
+	if len(entries) != 1 {
+		t.Fatalf("downloaded %d files, want 1", len(entries))
+	}
+	if filepath.Ext(entries[0].Name()) != ".png" {
+		t.Errorf("saved as %s, want .png from Content-Type", entries[0].Name())
+	}
+	if !strings.Contains(result, `.png"`) {
+		t.Errorf("src not rewritten to .png: %s", result)
+	}
+}
+
+func TestDownloadImagesSkipsDataURI(t *testing.T) {
+	// data: URIs would otherwise burn maxRetries x exponential backoff against
+	// an unsupported scheme. Test that they're filtered out before any GET.
+	var requestCount atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestCount.Add(1)
+		w.Write([]byte("real"))
+	}))
+	defer srv.Close()
+
+	dir := t.TempDir()
+	client := newTestClient(srv.URL)
+	client.ImagesDir = dir
+
+	html := `<img src="data:image/png;base64,iVBORw0KGgo=">` +
+		`<img src="javascript:alert(1)">` +
+		fmt.Sprintf(`<img src="%s/real.jpg">`, srv.URL)
+	result := downloadImages(context.Background(), client, html)
+
+	if got := requestCount.Load(); got != 1 {
+		t.Errorf("made %d HTTP requests, want 1 (only real.jpg)", got)
+	}
+	// data: and javascript: URLs must remain unchanged (we don't touch them).
+	if !strings.Contains(result, "data:image/png;base64") {
+		t.Errorf("data: URI was unexpectedly stripped: %s", result)
+	}
+	if !strings.Contains(result, "javascript:alert(1)") {
+		t.Errorf("javascript: URL was unexpectedly stripped: %s", result)
+	}
+}
+
+func TestDownloadImagesDedupsDuplicateSrc(t *testing.T) {
+	// Two <img src="X"> in one post must fetch X once, not race on the same
+	// temp file. Both <img> tags must end up rewritten to the same local path.
+	var requestCount atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestCount.Add(1)
+		w.Header().Set("Content-Type", "image/jpeg")
+		w.Write([]byte("FAKE"))
+	}))
+	defer srv.Close()
+
+	dir := t.TempDir()
+	client := newTestClient(srv.URL)
+	client.ImagesDir = dir
+
+	html := fmt.Sprintf(`<img src="%s/dup.jpg"><p>x</p><img src="%s/dup.jpg">`, srv.URL, srv.URL)
+	result := downloadImages(context.Background(), client, html)
+
+	if got := requestCount.Load(); got != 1 {
+		t.Errorf("made %d HTTP requests, want 1 (duplicate src deduped)", got)
+	}
+	entries, _ := os.ReadDir(dir)
+	if len(entries) != 1 {
+		t.Errorf("downloaded %d files, want 1", len(entries))
+	}
+	// Both <img> tags should have been rewritten — count occurrences of the
+	// local path; the original server URL must be gone.
+	if strings.Contains(result, srv.URL) {
+		t.Errorf("server URL still present after rewrite: %s", result)
+	}
+	if c := strings.Count(result, `src="`+filepath.ToSlash(dir)); c != 2 {
+		t.Errorf("expected both <img> rewritten to local path, found %d (result: %s)", c, result)
 	}
 }
 
@@ -463,6 +400,115 @@ func TestDownloadImagesSkipsOnError(t *testing.T) {
 	}
 }
 
+func TestDownloadImagesProtocolRelative(t *testing.T) {
+	// //host/pic.jpg must be fetched over https, not silently skipped. Needs a
+	// TLS server because the URL is normalized to https://.
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "image/jpeg")
+		w.Write([]byte("FAKE_IMAGE"))
+	}))
+	defer srv.Close()
+
+	dir := t.TempDir()
+	client := &Client{http: srv.Client(), baseURL: srv.URL, retryBackoff: time.Millisecond, HTTPConcurrency: 4, ImagesDir: dir}
+
+	host := strings.TrimPrefix(srv.URL, "https://")
+	html := fmt.Sprintf(`<img src="//%s/pic.jpg">`, host)
+	result := downloadImages(context.Background(), client, html)
+
+	entries, _ := os.ReadDir(dir)
+	if len(entries) != 1 {
+		t.Fatalf("downloaded %d files, want 1 (protocol-relative URL must be fetched)", len(entries))
+	}
+	if strings.Contains(result, "//"+host) {
+		t.Errorf("protocol-relative src was not rewritten: %s", result)
+	}
+}
+
+func TestDownloadImagesReusesRenamedExtension(t *testing.T) {
+	// Extension-less URL saved as its real (PNG) extension on the first run. A
+	// second run must reuse that file, not re-download because the skip-check
+	// only stats the guessed .jpg name.
+	var n atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n.Add(1)
+		w.Header().Set("Content-Type", "image/png")
+		w.Write([]byte("FAKE_PNG"))
+	}))
+	defer srv.Close()
+
+	dir := t.TempDir()
+	client := newTestClient(srv.URL)
+	client.ImagesDir = dir
+
+	html := fmt.Sprintf(`<img src="%s/image?id=42">`, srv.URL)
+	downloadImages(context.Background(), client, html) // downloads, renames .jpg -> .png
+	downloadImages(context.Background(), client, html) // must reuse the .png
+
+	if got := n.Load(); got != 1 {
+		t.Errorf("downloads = %d, want 1 (second run must reuse the renamed file)", got)
+	}
+	entries, _ := os.ReadDir(dir)
+	if len(entries) != 1 {
+		t.Errorf("files on disk = %d, want 1", len(entries))
+	}
+}
+
+func TestParsePostBodyFormats(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, testPostHTML)
+	}))
+	defer srv.Close()
+
+	cases := []struct {
+		format       string
+		wantContains string
+	}{
+		{FormatText, "Hello world"},
+		{FormatMarkdown, "Hello world"},
+		{FormatHTML, "<p>Hello world</p>"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.format, func(t *testing.T) {
+			client := newTestClient(srv.URL)
+			client.baseURL = srv.URL + "/%s"
+			client.BodyFormat = tc.format
+			post, err := ParsePost(context.Background(), client, "testuser", 1)
+			if err != nil {
+				t.Fatalf("ParsePost: %v", err)
+			}
+			if !strings.Contains(post.Body, tc.wantContains) {
+				t.Errorf("format %s: body = %q, want to contain %q", tc.format, post.Body, tc.wantContains)
+			}
+		})
+	}
+}
+
+func TestParseCommentsBodyFormat(t *testing.T) {
+	// Comment bodies must honour BodyFormat too, not stay raw HTML.
+	comment := `{"article":"<b>bold</b> reply","uname":"u","dname":"U","talkid":1,"dtalkid":10,"parent":0,"level":1,"ctime":"","ctime_ts":0,"deleted":0}`
+	page := fmt.Sprintf(`<html><body><script>Site.page = {"replycount":1,"comments":[%s]};</script></body></html>`, comment)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, page)
+	}))
+	defer srv.Close()
+
+	client := newTestClient(srv.URL)
+	client.baseURL = srv.URL + "/%s"
+	client.BodyFormat = FormatMarkdown
+
+	tree, err := ParseComments(context.Background(), client, "u", 1)
+	if err != nil {
+		t.Fatalf("ParseComments: %v", err)
+	}
+	if len(tree) != 1 {
+		t.Fatalf("roots = %d, want 1", len(tree))
+	}
+	if tree[0].Body != "**bold** reply" {
+		t.Errorf("comment body = %q, want %q", tree[0].Body, "**bold** reply")
+	}
+}
+
 // --- FindFirstPostID tests ---
 
 func TestFindFirstPostID(t *testing.T) {
@@ -473,9 +519,8 @@ func TestFindFirstPostID(t *testing.T) {
 			return
 		}
 		// Extract ID from path like /testuser/NNN.html
-		path := r.URL.Path
-		var id int
-		fmt.Sscanf(path, "/testuser/%d.html", &id)
+		base := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/testuser/"), ".html")
+		id, _ := strconv.Atoi(base)
 		if id >= 200 {
 			w.WriteHeader(200)
 		} else {
