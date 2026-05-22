@@ -120,8 +120,11 @@ func resolveLJIDs(ctx context.Context, client *lj.Client, user string, sel *sele
 			if from < 1 {
 				from = 1
 			}
+			if from > len(index) {
+				return nil, fmt.Errorf("ordinal #%d out of range (journal has %d indexable posts)", from, len(index))
+			}
 			if to > len(index) {
-				fmt.Fprintf(os.Stderr, "Warning: journal has %d posts, capping range to %d\n", len(index), len(index))
+				fmt.Fprintf(os.Stderr, "Warning: requested range end %d exceeds journal size %d, capping to %d\n", to, len(index), len(index))
 				to = len(index)
 			}
 			return index[from-1 : to], nil
