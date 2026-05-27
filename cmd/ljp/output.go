@@ -1,10 +1,8 @@
 package main
 
 import (
-	"embed"
 	"encoding/json"
 	"fmt"
-	"html/template"
 	"io"
 	"os"
 	"path/filepath"
@@ -13,101 +11,113 @@ import (
 	"github.com/wpt/ljp/pkg/lj"
 )
 
-//go:embed post.html
-var postTemplateFile embed.FS
+// newJSONEncoder builds the encoder used everywhere the CLI emits post JSON:
+// HTML chars stay unescaped (post bodies contain raw '<', '>'; downstream
+// consumers must re-escape before embedding in HTML), indent when pretty.
+func newJSONEncoder(w io.Writer, pretty bool) *json.Encoder {
+	enc := json.NewEncoder(w)
+	enc.SetEscapeHTML(false)
+	if pretty {
+		enc.SetIndent("", "  ")
+	}
+	return enc
+}
 
-var htmlTmpl = template.Must(
-	template.New("post.html").Funcs(template.FuncMap{
-		"raw": func(s string) template.HTML { return template.HTML(s) },
-	}).ParseFS(postTemplateFile, "post.html"),
-)
-
-func makePostWriter(dir string, pretty bool, render bool) func(*lj.Post) error {
+// makePostWriter returns a writer closure for the current output mode.
+// Construction-time errors (e.g. MkdirAll failure) are returned now, not
+// silently captured into every per-post call.
+func makePostWriter(dir string, pretty bool, render bool) (func(*lj.Post) error, error) {
 	if dir != "" {
 		if err := os.MkdirAll(dir, 0755); err != nil {
-			return func(p *lj.Post) error { return err }
+			return nil, fmt.Errorf("creating output dir: %w", err)
 		}
 		ext := ".json"
 		if render {
 			ext = ".html"
 		}
 		return func(p *lj.Post) error {
-			path := filepath.Join(dir, fmt.Sprintf("%d%s", p.ID, ext))
-			f, err := os.Create(path)
-			if err != nil {
-				return err
-			}
-			defer f.Close()
-			if render {
-				return renderHTML(f, p)
-			}
-			enc := json.NewEncoder(f)
-			if pretty {
-				enc.SetIndent("", "  ")
-			}
-			enc.SetEscapeHTML(false)
-			return enc.Encode(p)
-		}
+			return writePostFile(dir, ext, p, pretty, render)
+		}, nil
 	}
 	if render {
 		return func(p *lj.Post) error {
-			return renderHTML(os.Stdout, p)
-		}
+			return lj.RenderPost(os.Stdout, p)
+		}, nil
 	}
-	enc := json.NewEncoder(os.Stdout)
-	enc.SetEscapeHTML(false)
+	enc := newJSONEncoder(os.Stdout, pretty)
 	return func(p *lj.Post) error {
 		return enc.Encode(p)
-	}
+	}, nil
 }
 
-func writePost(post *lj.Post, output string, pretty bool, render bool) {
-	var w *os.File
-	var err error
-	if output != "" {
-		w, err = os.Create(output)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error creating file: %v\n", err)
-			os.Exit(1)
+// writePostFile writes a single post to {dir}/{id}{ext} atomically: encode to
+// a sibling .tmp file, close, then rename. Crash-resilient against a
+// half-written file blocking --resume; not fsynced (program-crash atomicity
+// only, not power-loss durability).
+func writePostFile(dir, ext string, p *lj.Post, pretty, render bool) error {
+	final := filepath.Join(dir, fmt.Sprintf("%d%s", p.ID, ext))
+	tmp := final + ".tmp"
+	f, err := os.Create(tmp)
+	if err != nil {
+		return err
+	}
+	encErr := func() error {
+		if render {
+			return lj.RenderPost(f, p)
 		}
-		defer w.Close()
-	} else {
-		w = os.Stdout
+		return newJSONEncoder(f, pretty).Encode(p)
+	}()
+	closeErr := f.Close()
+	if encErr != nil {
+		_ = os.Remove(tmp)
+		return encErr
+	}
+	if closeErr != nil {
+		_ = os.Remove(tmp)
+		return closeErr
+	}
+	return os.Rename(tmp, final)
+}
+
+func writePost(post *lj.Post, output string, pretty bool, render bool) error {
+	if output == "" {
+		if render {
+			return lj.RenderPost(os.Stdout, post)
+		}
+		return newJSONEncoder(os.Stdout, pretty).Encode(post)
 	}
 
+	f, err := os.Create(output)
+	if err != nil {
+		return fmt.Errorf("creating output file: %w", err)
+	}
+	var encErr error
 	if render {
-		if err := renderHTML(w, post); err != nil {
-			fmt.Fprintf(os.Stderr, "Error rendering HTML: %v\n", err)
-			os.Exit(1)
-		}
+		encErr = lj.RenderPost(f, post)
 	} else {
-		enc := json.NewEncoder(w)
-		if pretty {
-			enc.SetIndent("", "  ")
-		}
-		enc.SetEscapeHTML(false)
-		if err := enc.Encode(post); err != nil {
-			fmt.Fprintf(os.Stderr, "Error encoding JSON: %v\n", err)
-			os.Exit(1)
-		}
+		encErr = newJSONEncoder(f, pretty).Encode(post)
 	}
-
-	if output != "" {
-		fmt.Fprintf(os.Stderr, "Written to %s\n", output)
+	closeErr := f.Close()
+	if encErr != nil {
+		return fmt.Errorf("writing %s: %w", output, encErr)
 	}
-}
-
-func renderHTML(w io.Writer, post *lj.Post) error {
-	return htmlTmpl.Execute(w, post)
+	if closeErr != nil {
+		return fmt.Errorf("closing %s: %w", output, closeErr)
+	}
+	fmt.Fprintf(os.Stderr, "Written to %s\n", output)
+	return nil
 }
 
 // makeSyncPostWriter wraps makePostWriter with a mutex for concurrent use.
-func makeSyncPostWriter(dir string, pretty bool, render bool) func(*lj.Post) error {
-	inner := makePostWriter(dir, pretty, render)
+func makeSyncPostWriter(dir string, pretty bool, render bool) (func(*lj.Post) error, error) {
+	inner, err := makePostWriter(dir, pretty, render)
+	if err != nil {
+		return nil, err
+	}
 	var mu sync.Mutex
 	return func(p *lj.Post) error {
 		mu.Lock()
 		defer mu.Unlock()
 		return inner(p)
-	}
+	}, nil
 }
