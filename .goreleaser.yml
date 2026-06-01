@@ -5,6 +5,9 @@ builds:
     binary: ljp
     env:
       - CGO_ENABLED=0
+    # Stamp the version into the binary so `ljp --version` reports the tag.
+    ldflags:
+      - -s -w -X main.version={{.Version}}
     goos:
       - linux
       - darwin
@@ -16,7 +19,7 @@ builds:
 archives:
   - format_overrides:
       - goos: windows
-        format: zip
+        formats: [zip]
 
 changelog:
   sort: asc

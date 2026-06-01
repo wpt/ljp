@@ -8,11 +8,28 @@ on:
 
 jobs:
   test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - run: go build ./...
+      - run: go vet ./...
+      - run: go test -race -cover ./...
+
+  lint:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
-      - run: go vet ./...
-      - run: go test -cover ./...
+      - name: Install staticcheck
+        # Pinned so a new staticcheck release can't fail CI with zero code changes.
+        run: go install honnef.co/go/tools/cmd/staticcheck@v0.7.0
+      - run: staticcheck ./...
