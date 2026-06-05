@@ -1,0 +1,7 @@
+# Normalize line endings: Go tooling (gofmt) is LF-only. Without this the
+# repo's LF guarantee relies on each contributor's core.autocrlf setting.
+* text=auto eol=lf
+*.go text eol=lf
+*.html text eol=lf
+*.md text eol=lf
+*.yml text eol=lf
