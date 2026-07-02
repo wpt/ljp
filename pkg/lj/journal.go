@@ -2,8 +2,11 @@ package lj
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"net/http"
 	"slices"
+	"strings"
 	"sync"
 	"time"
 
@@ -77,75 +80,120 @@ func FindLastPostID(ctx context.Context, client *Client, user string) (int, erro
 	return slices.Max(ids), nil
 }
 
-// FetchPostIndex returns all post LJ IDs in chronological order (oldest first).
-func FetchPostIndex(ctx context.Context, client *Client, user string) ([]int, error) {
+// forEachNewIndexID walks the ?skip= index pages sequentially, calling fn once
+// per previously-unseen post ID in document order. Stops when a page yields no
+// new IDs — LJ returns the last page's content forever for out-of-range skips.
+// An error from fn aborts the walk and is returned as-is.
+func forEachNewIndexID(ctx context.Context, client *Client, user string, fn func(id int) error) error {
 	log := client.log()
 	host := client.journalHost(user)
 	seen := make(map[int]bool)
-	var all []int
 	for skip := 0; ; skip += 20 {
 		if err := ctx.Err(); err != nil {
-			return nil, err
+			return err
 		}
-		log.Debug("indexing", "skip", skip)
+		log.Debug("fetching index", "skip", skip)
 
 		resp, err := client.Get(ctx, client.journalURL(user, skip))
 		if err != nil {
-			return nil, fmt.Errorf("fetch index skip=%d: %w", skip, err)
+			return fmt.Errorf("fetch index skip=%d: %w", skip, err)
 		}
 
 		ids, err := ParseJournalIndex(resp.Body, host)
 		resp.Body.Close()
 		if err != nil {
-			return nil, fmt.Errorf("parse index skip=%d: %w", skip, err)
-		}
-
-		if len(ids) == 0 {
-			break
+			return fmt.Errorf("parse index skip=%d: %w", skip, err)
 		}
 
 		newPosts := 0
 		for _, id := range ids {
-			if !seen[id] {
-				seen[id] = true
-				all = append(all, id)
-				newPosts++
+			if seen[id] {
+				continue
+			}
+			seen[id] = true
+			newPosts++
+			if err := fn(id); err != nil {
+				return err
 			}
 		}
 
 		if newPosts == 0 {
-			break
+			return nil
 		}
+	}
+}
+
+// FetchPostIndex returns all post LJ IDs in chronological order (oldest first).
+func FetchPostIndex(ctx context.Context, client *Client, user string) ([]int, error) {
+	var all []int
+	err := forEachNewIndexID(ctx, client, user, func(id int) error {
+		all = append(all, id)
+		return nil
+	})
+	if err != nil {
+		return nil, err
 	}
 
 	// Sort ascending = oldest first (LJ IDs grow with creation). More robust than
 	// reversing document order, which a pinned/sticky entry would misplace.
 	slices.Sort(all)
 
-	log.Info("indexed posts", "count", len(all))
+	client.log().Info("indexed posts", "count", len(all))
 	return all, nil
 }
 
 // FetchFullPostIndex returns all post IDs by iterating monthly archive pages.
 // This catches old posts that FetchPostIndex misses due to LJ index page limits.
-// Fetches months concurrently (capped at HTTPConcurrency). Per-month errors are
-// logged as warnings and skipped — a single bad month does not fail the whole index.
-// Honour ctx cancellation: cancellation aborts in-flight fetches and returns ctx.Err().
+// The current year is walked in full (not capped at the current month) so
+// future-dated pinned posts are also caught; empty/future months simply return
+// nothing. Unlike FetchMonthlyPostIndex, a failed month here is a logged
+// warning, not an error — losing one month of 300+ to a transient failure
+// shouldn't abort a whole-journal walk.
 func FetchFullPostIndex(ctx context.Context, client *Client, user string) ([]int, error) {
+	return fetchMonthlyIndex(ctx, client, user, 1999, 1, time.Now().Year(), 12, false)
+}
+
+// FetchMonthlyPostIndex returns the post IDs found on the /YYYY/MM/ monthly
+// archive pages from fromYear/fromMonth to toYear/toMonth inclusive, sorted
+// ascending (chronological). Fetches months concurrently (capped at
+// HTTPConcurrency). A month whose archive page is missing (404) simply
+// contributes no posts, but any month that fails to fetch or parse (5xx/429
+// after retries, transport errors) makes the whole call return an error —
+// for a user-specified range, silently dropping a failed month would present
+// an incomplete result as a complete one. An invalid range is an error.
+// Honours ctx cancellation: it aborts in-flight fetches and returns ctx.Err().
+func FetchMonthlyPostIndex(ctx context.Context, client *Client, user string, fromYear, fromMonth, toYear, toMonth int) ([]int, error) {
+	return fetchMonthlyIndex(ctx, client, user, fromYear, fromMonth, toYear, toMonth, true)
+}
+
+// fetchMonthlyIndex implements the monthly-archive walk. strict controls the
+// failed-month policy: error out (user-specified ranges) vs warn-and-skip
+// (the exhaustive 300+-month whole-journal walk).
+func fetchMonthlyIndex(ctx context.Context, client *Client, user string, fromYear, fromMonth, toYear, toMonth int, strict bool) ([]int, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
+	}
+	if fromMonth < 1 || fromMonth > 12 || toMonth < 1 || toMonth > 12 {
+		return nil, fmt.Errorf("month out of range in %04d/%02d-%04d/%02d", fromYear, fromMonth, toYear, toMonth)
+	}
+	if fromYear*100+fromMonth > toYear*100+toMonth {
+		return nil, fmt.Errorf("inverted month range: %04d/%02d-%04d/%02d", fromYear, fromMonth, toYear, toMonth)
 	}
 	log := client.log()
 	host := client.journalHost(user)
 
-	// Build the list of (year, month) tuples first, then fan out. The current
-	// year is walked in full (not capped at the current month) so future-dated
-	// pinned posts are also caught; empty/future months simply return nothing.
+	// Build the list of (year, month) tuples first, then fan out.
 	type ym struct{ year, month int }
-	now := time.Now()
 	var months []ym
-	for year := 1999; year <= now.Year(); year++ {
-		for month := 1; month <= 12; month++ {
+	for year := fromYear; year <= toYear; year++ {
+		m1, m2 := 1, 12
+		if year == fromYear {
+			m1 = fromMonth
+		}
+		if year == toYear {
+			m2 = toMonth
+		}
+		for month := m1; month <= m2; month++ {
 			months = append(months, ym{year, month})
 		}
 	}
@@ -153,7 +201,18 @@ func FetchFullPostIndex(ctx context.Context, client *Client, user string) ([]int
 	var mu sync.Mutex
 	seen := make(map[int]bool)
 	var all []int
-	okCount := 0 // months that fetched+parsed OK (guarded by mu)
+	okCount := 0              // months that fetched+parsed OK (guarded by mu)
+	var failedMonths []string // months that failed with a non-404 error (guarded by mu)
+	var firstErr error        // first failed month's error (guarded by mu)
+
+	recordFailure := func(year, month int, err error) {
+		mu.Lock()
+		failedMonths = append(failedMonths, fmt.Sprintf("%04d/%02d", year, month))
+		if firstErr == nil {
+			firstErr = err
+		}
+		mu.Unlock()
+	}
 
 	eg, ectx := errgroup.WithContext(ctx)
 	eg.SetLimit(client.concurrency())
@@ -173,6 +232,14 @@ func FetchFullPostIndex(ctx context.Context, client *Client, user string) ([]int
 				if ectx.Err() != nil {
 					return ectx.Err()
 				}
+				// A 404 month is not a failure: LJ has no archive page before
+				// the journal's first post (and none for empty months) — it
+				// simply contributes no posts. Anything else (5xx/429 after
+				// retries, transport errors) is a real failure.
+				var se *StatusError
+				if !(errors.As(err, &se) && se.Code == http.StatusNotFound) {
+					recordFailure(m.year, m.month, err)
+				}
 				log.Warn("month fetch failed", "year", m.year, "month", m.month, "err", err)
 				return nil
 			}
@@ -180,6 +247,7 @@ func FetchFullPostIndex(ctx context.Context, client *Client, user string) ([]int
 			ids, perr := ParseJournalIndex(resp.Body, host)
 			resp.Body.Close()
 			if perr != nil {
+				recordFailure(m.year, m.month, perr)
 				log.Warn("month parse failed", "year", m.year, "month", m.month, "err", perr)
 				return nil
 			}
@@ -201,18 +269,26 @@ func FetchFullPostIndex(ctx context.Context, client *Client, user string) ([]int
 		return nil, err
 	}
 
-	// Every month failing (not just being empty) means the journal is
-	// unreachable — a typo'd username, network outage, or a removed journal.
-	// Surface that instead of returning a silent empty "success".
+	// In strict mode any failed month poisons the result: a user-specified
+	// range with a silently-missing month would look complete while it isn't.
+	if strict && len(failedMonths) > 0 {
+		slices.Sort(failedMonths) // parallel completion order is random
+		return nil, fmt.Errorf("%d archive month(s) failed (%s): %w",
+			len(failedMonths), strings.Join(failedMonths, ", "), firstErr)
+	}
+
+	// Every month failing or missing (not just being empty) means the journal
+	// is unreachable — a typo'd username, network outage, or a removed
+	// journal. Surface that instead of returning a silent empty "success".
 	if okCount == 0 && len(months) > 0 {
-		return nil, fmt.Errorf("no archive pages fetched for %s (wrong username or all months failed)", user)
+		return nil, fmt.Errorf("no archive pages fetched for %s (wrong username, or none of the %d requested months exist)", user, len(months))
 	}
 
 	// Sort by ID (chronological). Required because parallel fetches arrive in
 	// non-deterministic order.
 	slices.Sort(all)
 
-	log.Info("full index complete", "count", len(all))
+	log.Info("monthly index complete", "count", len(all))
 	return all, nil
 }
 
@@ -223,61 +299,26 @@ func FetchFullPostIndex(ctx context.Context, client *Client, user string) ([]int
 // missed — use FetchFullPostIndex for an exhaustive monthly-archive walk.
 func ParseJournal(ctx context.Context, client *Client, user string, comments bool, onPost func(*Post) error) error {
 	log := client.log()
-	host := client.journalHost(user)
-	seen := make(map[int]bool)
-	for skip := 0; ; skip += 20 {
-		log.Debug("fetching index", "skip", skip)
+	return forEachNewIndexID(ctx, client, user, func(id int) error {
+		if client.SkipIDs[id] {
+			log.Debug("skipping existing post", "id", id)
+			return nil
+		}
 
-		resp, err := client.Get(ctx, client.journalURL(user, skip))
+		log.Debug("fetching post", "user", user, "id", id)
+		post, err := ParsePost(ctx, client, user, id)
 		if err != nil {
-			return fmt.Errorf("fetch index skip=%d: %w", skip, err)
+			log.Warn("post fetch failed", "id", id, "err", err)
+			return nil
 		}
 
-		ids, err := ParseJournalIndex(resp.Body, host)
-		resp.Body.Close()
-		if err != nil {
-			return fmt.Errorf("parse index skip=%d: %w", skip, err)
-		}
-
-		if len(ids) == 0 {
-			break
-		}
-
-		newPosts := 0
-		for _, id := range ids {
-			if seen[id] {
-				continue
-			}
-			seen[id] = true
-			newPosts++
-
-			if client.SkipIDs[id] {
-				log.Debug("skipping existing post", "id", id)
-				continue
-			}
-
-			log.Debug("fetching post", "user", user, "id", id)
-			post, err := ParsePost(ctx, client, user, id)
+		if comments {
+			post.Comments, err = ParseComments(ctx, client, user, id)
 			if err != nil {
-				log.Warn("post fetch failed", "id", id, "err", err)
-				continue
-			}
-
-			if comments {
-				post.Comments, err = ParseComments(ctx, client, user, id)
-				if err != nil {
-					log.Warn("comments fetch failed", "id", id, "err", err)
-				}
-			}
-
-			if err := onPost(post); err != nil {
-				return err
+				log.Warn("comments fetch failed", "id", id, "err", err)
 			}
 		}
 
-		if newPosts == 0 {
-			break
-		}
-	}
-	return nil
+		return onPost(post)
+	})
 }

@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
+	"sync"
 	"testing"
 )
 
@@ -107,6 +109,116 @@ func TestFetchFullPostIndexCanceled(t *testing.T) {
 	_, err := FetchFullPostIndex(ctx, client, "testuser")
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("FetchFullPostIndex error = %v, want context.Canceled", err)
+	}
+}
+
+// TestFetchMonthlyPostIndex: only months inside the requested range are
+// fetched, and IDs from outside the range never appear in the result.
+func TestFetchMonthlyPostIndex(t *testing.T) {
+	var mu sync.Mutex
+	requested := map[string]bool{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		requested[r.URL.Path] = true
+		mu.Unlock()
+		switch r.URL.Path {
+		case "/testuser/2019/11/":
+			fmt.Fprint(w, `<html><body><a href="/100.html">a</a></body></html>`)
+		case "/testuser/2020/02/":
+			fmt.Fprint(w, `<html><body><a href="/200.html">b</a></body></html>`)
+		case "/testuser/2020/03/":
+			// Outside the requested range — must never be fetched.
+			fmt.Fprint(w, `<html><body><a href="/999.html">c</a></body></html>`)
+		default:
+			fmt.Fprint(w, `<html><body></body></html>`)
+		}
+	}))
+	defer srv.Close()
+
+	client := newTestClient(srv.URL)
+	client.baseURL = srv.URL + "/%s"
+
+	ids, err := FetchMonthlyPostIndex(context.Background(), client, "testuser", 2019, 11, 2020, 2)
+	if err != nil {
+		t.Fatalf("FetchMonthlyPostIndex: %v", err)
+	}
+	if len(ids) != 2 || ids[0] != 100 || ids[1] != 200 {
+		t.Errorf("ids = %v, want [100 200]", ids)
+	}
+
+	// Exactly the four months 2019/11..2020/02, crossing the year boundary.
+	want := []string{"/testuser/2019/11/", "/testuser/2019/12/", "/testuser/2020/01/", "/testuser/2020/02/"}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(requested) != len(want) {
+		t.Errorf("requested %d months, want %d: %v", len(requested), len(want), requested)
+	}
+	for _, p := range want {
+		if !requested[p] {
+			t.Errorf("month %s was not fetched", p)
+		}
+	}
+}
+
+// TestFetchMonthlyPostIndexFailedMonthIsError: a month that persistently
+// fails (retries exhausted on 500) must fail the whole user-specified range —
+// silently dropping it would present an incomplete result as complete.
+func TestFetchMonthlyPostIndexFailedMonthIsError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/testuser/2019/11/":
+			w.WriteHeader(500)
+		case "/testuser/2019/12/":
+			fmt.Fprint(w, `<html><body><a href="/100.html">a</a></body></html>`)
+		default:
+			w.WriteHeader(404)
+		}
+	}))
+	defer srv.Close()
+
+	client := newTestClient(srv.URL)
+	client.baseURL = srv.URL + "/%s"
+
+	_, err := FetchMonthlyPostIndex(context.Background(), client, "testuser", 2019, 11, 2019, 12)
+	if err == nil {
+		t.Fatal("expected error when a requested month fails, got nil")
+	}
+	if !strings.Contains(err.Error(), "2019/11") {
+		t.Errorf("error should name the failed month, got: %v", err)
+	}
+}
+
+// TestFetchMonthlyPostIndex404MonthIsEmpty: 404 means "no archive page for
+// that month" (pre-creation or empty) — not a failure, even in strict mode.
+func TestFetchMonthlyPostIndex404MonthIsEmpty(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/testuser/2019/12/" {
+			fmt.Fprint(w, `<html><body><a href="/100.html">a</a></body></html>`)
+			return
+		}
+		w.WriteHeader(404)
+	}))
+	defer srv.Close()
+
+	client := newTestClient(srv.URL)
+	client.baseURL = srv.URL + "/%s"
+
+	ids, err := FetchMonthlyPostIndex(context.Background(), client, "testuser", 2019, 11, 2019, 12)
+	if err != nil {
+		t.Fatalf("404 month must not fail the range: %v", err)
+	}
+	if len(ids) != 1 || ids[0] != 100 {
+		t.Errorf("ids = %v, want [100]", ids)
+	}
+}
+
+func TestFetchMonthlyPostIndexInvalidRange(t *testing.T) {
+	client := newTestClient("http://127.0.0.1")
+	if _, err := FetchMonthlyPostIndex(context.Background(), client, "u", 2020, 5, 2019, 5); err == nil {
+		t.Error("expected error for inverted range")
+	}
+	if _, err := FetchMonthlyPostIndex(context.Background(), client, "u", 2020, 13, 2021, 1); err == nil {
+		t.Error("expected error for month out of range")
 	}
 }
 
