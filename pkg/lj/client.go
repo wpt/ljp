@@ -137,6 +137,23 @@ func (c *Client) log() *slog.Logger {
 	return c.Logger
 }
 
+// effectiveFormat normalizes BodyFormat to one of the three known values:
+// empty means FormatHTML, unknown values warn and fall back to FormatHTML.
+// The single source of truth for format dispatch — ParsePost and
+// fetchCommentsPage both resolve the format through here so post and comment
+// bodies can never disagree on how a value is interpreted.
+func (c *Client) effectiveFormat() string {
+	switch c.BodyFormat {
+	case "", FormatHTML:
+		return FormatHTML
+	case FormatMarkdown, FormatText:
+		return c.BodyFormat
+	default:
+		c.log().Warn("unknown body format, using html", "format", c.BodyFormat)
+		return FormatHTML
+	}
+}
+
 // concurrency returns the effective fan-out width, ensuring callers using
 // errgroup.SetLimit don't accidentally pass 0 (which means "unlimited").
 func (c *Client) concurrency() int {
@@ -306,24 +323,25 @@ func (c *Client) Exists(ctx context.Context, url string) (bool, error) {
 	return resp.StatusCode == http.StatusOK, nil
 }
 
-// downloadCore is the shared implementation of downloadFile and downloadInto.
+// downloadCore is the shared implementation of the download helpers.
 // `existing` reports current file size and whether it exists (size 0 + exists
 // counts as incomplete and is retried — a 0-byte leftover from a crashed run
 // must not be treated as "done"). `create` opens the temp file for writing.
-// `finalize` atomically promotes the temp file to its final name. Splitting
-// these three closures lets us share the body for both raw-filesystem and
-// *os.Root code paths without duplicating the GET + io.Copy + rename block.
+// `finalize` atomically promotes the temp file to its final name; it receives
+// the response Content-Type so the final name can be derived from the server's
+// MIME hint (see downloadIntoAs). Splitting these closures lets us share the
+// body for both raw-filesystem and *os.Root code paths without duplicating the
+// GET + io.Copy + rename block.
 //
-// Returns the response Content-Type alongside the error so callers downloading
-// extension-less URLs can correct the filename via the server's MIME hint.
-// An empty string is returned when the file was skipped (already present) or
-// the response carried no Content-Type header.
+// Returns the response Content-Type alongside the error. An empty string is
+// returned when the file was skipped (already present) or the response
+// carried no Content-Type header.
 func (c *Client) downloadCore(
 	ctx context.Context,
 	url string,
 	existing func() (size int64, ok bool),
 	create func() (io.WriteCloser, error),
-	finalize func() error,
+	finalize func(contentType string) error,
 	cleanup func(),
 ) (string, error) {
 	if size, ok := existing(); ok && size > 0 {
@@ -349,7 +367,7 @@ func (c *Client) downloadCore(
 		cleanup()
 		return contentType, err
 	}
-	if err := finalize(); err != nil {
+	if err := finalize(contentType); err != nil {
 		cleanup()
 		return contentType, err
 	}
@@ -373,7 +391,7 @@ func (c *Client) downloadFile(ctx context.Context, url, destPath string) error {
 			return st.Size(), true
 		},
 		func() (io.WriteCloser, error) { return os.Create(tmp) },
-		func() error { return os.Rename(tmp, destPath) },
+		func(string) error { return os.Rename(tmp, destPath) },
 		func() { os.Remove(tmp) },
 	)
 	return err
@@ -382,8 +400,7 @@ func (c *Client) downloadFile(ctx context.Context, url, destPath string) error {
 // downloadInto downloads URL into root/name with the same skip-non-empty +
 // tmp+rename semantics as downloadFile. Using *os.Root keeps writes sandboxed
 // inside the root — name cannot escape via "..", absolute paths, or symlinks
-// pointing outside. Returns the response Content-Type so callers can fix
-// extension-less filenames.
+// pointing outside. Returns the response Content-Type.
 func (c *Client) downloadInto(ctx context.Context, root *os.Root, url, name string) (string, error) {
 	tmp := fmt.Sprintf("%s.%d.tmp", name, tmpCounter.Add(1))
 	return c.downloadCore(
@@ -396,9 +413,37 @@ func (c *Client) downloadInto(ctx context.Context, root *os.Root, url, name stri
 			return st.Size(), true
 		},
 		func() (io.WriteCloser, error) { return root.Create(tmp) },
-		func() error { return root.Rename(tmp, name) },
+		func(string) error { return root.Rename(tmp, name) },
 		func() { root.Remove(tmp) },
 	)
+}
+
+// downloadIntoAs downloads URL into root like downloadInto, but the final
+// filename is chosen from the response Content-Type by nameFor once headers
+// arrive: the temp file is renamed directly to that name. This lets callers
+// place extension-guessed downloads straight under their real extension with
+// no post-hoc rename — concurrent downloads of the same URL converge on the
+// same final name instead of racing a rename window (during which a sibling
+// goroutine could observe, and rewrite an <img src> to, a name about to
+// vanish). `existing` is the caller's skip probe (return ok with size > 0 to
+// skip). Returns the final name used; "" when the download was skipped.
+func (c *Client) downloadIntoAs(ctx context.Context, root *os.Root, url string, existing func() (int64, bool), nameFor func(contentType string) string) (string, error) {
+	tmp := fmt.Sprintf("dl.%d.tmp", tmpCounter.Add(1))
+	var final string
+	_, err := c.downloadCore(
+		ctx, url,
+		existing,
+		func() (io.WriteCloser, error) { return root.Create(tmp) },
+		func(ct string) error {
+			final = nameFor(ct)
+			return root.Rename(tmp, final)
+		},
+		func() { root.Remove(tmp) },
+	)
+	if err != nil {
+		return "", err
+	}
+	return final, nil
 }
 
 func (c *Client) postURL(user string, id int) string {

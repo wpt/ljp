@@ -80,37 +80,14 @@ func ParsePost(ctx context.Context, client *Client, user string, id int) (*Post,
 
 	bodyEl := doc.Find("div.aentry-post__text")
 	if bodyEl.Length() > 0 {
-		format := client.BodyFormat
-		switch format {
-		case "":
-			format = FormatHTML
-		case FormatHTML, FormatMarkdown, FormatText:
-			// ok
-		default:
-			client.log().Warn("unknown body format, using html", "format", format)
-			format = FormatHTML
-		}
-
+		format := client.effectiveFormat()
+		bodyHTML, _ := bodyEl.Html()
 		// Skip image download for text output — the rewritten <img src> would be
-		// thrown away by bodyEl.Text() anyway, so don't waste the bandwidth.
-		var bodyHTML string
-		if format != FormatText {
-			bodyHTML, _ = bodyEl.Html()
-			if client.ImagesDir != "" {
-				bodyHTML = downloadImages(ctx, client, bodyHTML)
-			}
+		// thrown away by the plain-text conversion anyway.
+		if client.ImagesDir != "" && format != FormatText {
+			bodyHTML = downloadImages(ctx, client, bodyHTML)
 		}
-
-		switch format {
-		case FormatText:
-			// Convert the raw body HTML (no image download needed for text).
-			raw, _ := bodyEl.Html()
-			post.Body = htmlToText(raw)
-		case FormatMarkdown:
-			post.Body = HTMLToMarkdown(bodyHTML)
-		default: // FormatHTML
-			post.Body = bodyHTML
-		}
+		post.Body = formatBody(format, bodyHTML)
 	} else {
 		// No body container on a 200 page (adult-content interstitial for logged-
 		// out visitors, suspended-journal notice, or a markup change). Warn so a
@@ -186,11 +163,11 @@ func ParseComments(ctx context.Context, client *Client, user string, id int) ([]
 	return BuildCommentTree(all), nil
 }
 
-// formatBody converts raw body HTML to the client's configured BodyFormat.
-// Shared by the post body and comment bodies so output is consistent across
-// both. Unknown/empty formats fall through to raw HTML.
-func formatBody(client *Client, raw string) string {
-	switch client.BodyFormat {
+// formatBody converts raw body HTML to format, which must be a normalized
+// value from Client.effectiveFormat. Shared by the post body and comment
+// bodies so output is consistent across both.
+func formatBody(format, raw string) string {
+	switch format {
 	case FormatMarkdown:
 		return HTMLToMarkdown(raw)
 	case FormatText:
@@ -228,8 +205,17 @@ func fetchCommentsPage(ctx context.Context, client *Client, user string, id, pag
 		return nil, 0, fmt.Errorf("extract Site.page page=%d: %w", page, err)
 	}
 
+	format := client.effectiveFormat()
 	var comments []*Comment
 	for _, rc := range sp.Comments {
+		article := rc.Article
+		// Comment bodies can embed images too — download them like ParsePost
+		// does for the post body, so an offline archive doesn't reach for the
+		// network when comments are rendered. Skipped for FormatText for the
+		// same reason as in ParsePost: the rewritten src would be discarded.
+		if client.ImagesDir != "" && format != FormatText {
+			article = downloadImages(ctx, client, article)
+		}
 		c := &Comment{
 			ID:       rc.DTalkID,
 			TalkID:   rc.TalkID,
@@ -241,10 +227,10 @@ func fetchCommentsPage(ctx context.Context, client *Client, user string, id, pag
 			DateUnix: rc.CTimeTS,
 			// Honour BodyFormat so `--format markdown/text` comments match the
 			// post body instead of staying raw HTML.
-			Body:     formatBody(client, rc.Article),
-			Subject:  rc.Subject,
-			Userpic:  rc.Userpic,
-			Deleted:  rc.Deleted != 0,
+			Body:    formatBody(format, article),
+			Subject: rc.Subject,
+			Userpic: rc.Userpic,
+			Deleted: rc.Deleted != 0,
 		}
 		comments = append(comments, c)
 	}
@@ -377,19 +363,21 @@ func extractJSONFrom(html []byte, from int) (js []byte, next int, err error) {
 	return nil, next, fmt.Errorf("unmatched braces in Site.page")
 }
 
-// imageExtAllowlist is the set of file extensions we accept verbatim from the
-// URL path. Anything outside this set is treated as missing-extension (guessed)
-// so the Content-Type fallback can correct it. Caps weird URLs like
+// imageExts is the set of image file extensions we recognise, in the order
+// findExistingImage probes them (.jpg first — it's the default guess).
+var imageExts = []string{".jpg", ".jpeg", ".png", ".gif", ".webp", ".avif", ".bmp"}
+
+// imageExtAllowlist is imageExts as a set: extensions accepted verbatim from
+// the URL path. Anything outside is treated as missing-extension (guessed) so
+// the Content-Type fallback can correct it. Also caps weird URLs like
 // /foo.<1MB-of-junk> from producing pathological filenames.
-var imageExtAllowlist = map[string]bool{
-	".jpg":  true,
-	".jpeg": true,
-	".png":  true,
-	".gif":  true,
-	".webp": true,
-	".avif": true,
-	".bmp":  true,
-}
+var imageExtAllowlist = func() map[string]bool {
+	m := make(map[string]bool, len(imageExts))
+	for _, e := range imageExts {
+		m[e] = true
+	}
+	return m
+}()
 
 // downloadImages finds all <img src> in HTML, downloads images concurrently
 // into client.ImagesDir, and rewrites src to the local filesystem path so the
@@ -397,6 +385,11 @@ var imageExtAllowlist = map[string]bool{
 // Skips data:/javascript:/vbscript: URIs and non-http(s) URLs so they don't
 // burn retries against an unsupported scheme.
 func downloadImages(ctx context.Context, client *Client, html string) string {
+	// Fast path: most comment bodies (and many posts) carry no images at all —
+	// skip the DOM parse and image-dir setup entirely.
+	if !strings.Contains(strings.ToLower(html), "<img") {
+		return html
+	}
 	log := client.log()
 	if err := os.MkdirAll(client.ImagesDir, 0755); err != nil {
 		log.Warn("mkdir failed", "dir", client.ImagesDir, "err", err)
@@ -419,7 +412,8 @@ func downloadImages(ctx context.Context, client *Client, html string) string {
 		sels       []*goquery.Selection // all <img> with this src — share one download
 		fetchURL   string               // URL to GET (// normalized to https:)
 		filename   string
-		extGuessed bool // true when URL had no extension; allow Content-Type override
+		hash       string
+		extGuessed bool // true when URL had no extension; name comes from Content-Type
 		resolved   bool // already on disk from a prior run — skip download, just rewrite
 	}
 	var jobs []job
@@ -461,8 +455,8 @@ func downloadImages(ctx context.Context, client *Client, html string) string {
 		hash := fmt.Sprintf("%x", sha256.Sum256([]byte(src)))[:16]
 		ext := strings.ToLower(path.Ext(u.Path))
 		guessed := false
-		// Apply an allowlist — anything weird falls through to the
-		// Content-Type-based rename so we never end up with {hash}.html /
+		// Apply an allowlist — anything weird gets its name from the response
+		// Content-Type instead, so we never end up with {hash}.html /
 		// {hash}.<1MB-of-junk> / {hash}.exe on disk. Allowlist also caps
 		// length implicitly (longest entry is ".jpeg").
 		if !imageExtAllowlist[ext] {
@@ -471,9 +465,9 @@ func downloadImages(ctx context.Context, client *Client, html string) string {
 		}
 		filename := hash + ext
 		resolved := false
-		// A prior run may have saved this extension-less image under its real
-		// extension (Content-Type rename below). The skip-check stats the exact
-		// name, so probe known siblings first to avoid re-downloading it forever.
+		// A prior run (or another body processed earlier in this run) may have
+		// saved this extension-less image under its real extension. Probe known
+		// siblings so it isn't re-downloaded forever.
 		if guessed {
 			if existing := findExistingImage(root, hash); existing != "" {
 				filename = existing
@@ -485,6 +479,7 @@ func downloadImages(ctx context.Context, client *Client, html string) string {
 			sels:       []*goquery.Selection{s},
 			fetchURL:   fetchURL,
 			filename:   filename,
+			hash:       hash,
 			extGuessed: guessed && !resolved,
 			resolved:   resolved,
 		})
@@ -492,25 +487,59 @@ func downloadImages(ctx context.Context, client *Client, html string) string {
 
 	// Download concurrently — bounded by client.HTTPConcurrency, which matches
 	// the Transport's MaxConnsPerHost so we don't queue more sockets than exist.
-	// Each goroutine writes to its own index in ok[] and contentTypes[], so no
-	// mutex is needed.
+	// Each goroutine writes only to its own index in ok[]/jobs[], so no mutex
+	// is needed.
 	eg, ectx := errgroup.WithContext(ctx)
 	eg.SetLimit(client.concurrency())
 	ok := make([]bool, len(jobs))
-	contentTypes := make([]string, len(jobs))
 	for i, j := range jobs {
 		if j.resolved {
 			ok[i] = true // already on disk from a prior run; just rewrite the src
 			continue
 		}
 		eg.Go(func() error {
-			ct, err := client.downloadInto(ectx, root, j.fetchURL, j.filename)
+			if !j.extGuessed {
+				if _, err := client.downloadInto(ectx, root, j.fetchURL, j.filename); err != nil {
+					log.Warn("image download failed", "url", j.fetchURL, "err", err)
+					return nil
+				}
+				ok[i] = true
+				return nil
+			}
+			// Extension-less URL: pick the final name from the response
+			// Content-Type BEFORE the tmp file is promoted, so the image never
+			// exists on disk under a wrong name. Concurrent downloads of the
+			// same URL (e.g. from comment pages fetched in parallel) then
+			// converge on the same final name instead of racing a rename.
+			reuse := ""
+			final, err := client.downloadIntoAs(ectx, root, j.fetchURL,
+				func() (int64, bool) {
+					// Another concurrently-processed body may have completed
+					// this image under any known extension — reuse it.
+					if name := findExistingImage(root, j.hash); name != "" {
+						reuse = name
+						return 1, true
+					}
+					return 0, false
+				},
+				func(ct string) string {
+					if ext := extFromContentType(ct); ext != "" {
+						return j.hash + ext
+					}
+					return j.filename // default {hash}.jpg guess
+				},
+			)
 			if err != nil {
 				log.Warn("image download failed", "url", j.fetchURL, "err", err)
 				return nil
 			}
+			switch {
+			case final != "":
+				jobs[i].filename = final
+			case reuse != "":
+				jobs[i].filename = reuse
+			}
 			ok[i] = true
-			contentTypes[i] = ct
 			return nil
 		})
 	}
@@ -523,18 +552,6 @@ func downloadImages(ctx context.Context, client *Client, html string) string {
 			continue
 		}
 		okCount++
-		// If the URL had no extension and the server told us the real type,
-		// rename to the correct extension so PNG/GIF/WebP downloads from
-		// extension-less URLs aren't mis-saved as .jpg.
-		if jobs[i].extGuessed {
-			if newExt := extFromContentType(contentTypes[i]); newExt != "" && newExt != ".jpg" {
-				base := strings.TrimSuffix(jobs[i].filename, ".jpg")
-				newName := base + newExt
-				if err := root.Rename(jobs[i].filename, newName); err == nil {
-					jobs[i].filename = newName
-				}
-			}
-		}
 		newSrc := filepath.ToSlash(filepath.Join(client.ImagesDir, jobs[i].filename))
 		for _, sel := range jobs[i].sels {
 			sel.SetAttr("src", newSrc)
@@ -549,11 +566,11 @@ func downloadImages(ctx context.Context, client *Client, html string) string {
 }
 
 // findExistingImage returns the name of an already-downloaded image for hash,
-// if any sibling {hash}.<ext> exists with non-zero size. Lets a re-run reuse a
-// file a prior run renamed from the guessed .jpg to its real extension instead
-// of re-downloading it (the skip-check only stats one exact name).
+// if any sibling {hash}.<ext> exists with non-zero size. Lets a run reuse a
+// file that a prior run (or another body in this run) saved under its real
+// Content-Type-derived extension instead of re-downloading it.
 func findExistingImage(root *os.Root, hash string) string {
-	for _, ext := range []string{".jpg", ".jpeg", ".png", ".gif", ".webp", ".avif", ".bmp"} {
+	for _, ext := range imageExts {
 		name := hash + ext
 		if st, err := root.Stat(name); err == nil && st.Size() > 0 {
 			return name

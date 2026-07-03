@@ -690,3 +690,80 @@ func TestFetchPostIndex(t *testing.T) {
 		t.Errorf("index = %v, want [111 222 333]", index)
 	}
 }
+
+// TestParseCommentsDownloadsImages: with ImagesDir set, images embedded in
+// comment bodies are downloaded and their src rewritten, same as post bodies.
+func TestParseCommentsDownloadsImages(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/pic.png" {
+			w.Header().Set("Content-Type", "image/png")
+			w.Write([]byte("FAKE_PNG"))
+			return
+		}
+		// Flat-view comments page: one comment whose article embeds an image.
+		// The image URL is built from r.Host so the handler needs no closure
+		// over the server URL.
+		imgURL := "http://" + r.Host + "/pic.png"
+		fmt.Fprintf(w, `<html><body><script>Site.page = {"replycount":1,"comments":[{"article":"look: <img src='%s'>","uname":"u1","dname":"User One","talkid":100,"dtalkid":1000,"parent":0,"level":1,"ctime":"January 1 2020, 12:00:00 UTC","ctime_ts":1577836800,"subject":"","userpic":"","deleted":0}]};</script></body></html>`, imgURL)
+	}))
+	defer srv.Close()
+
+	dir := t.TempDir()
+	client := newTestClient(srv.URL)
+	client.baseURL = srv.URL + "/%s"
+	client.ImagesDir = dir
+
+	comments, err := ParseComments(context.Background(), client, "testuser", 1)
+	if err != nil {
+		t.Fatalf("ParseComments: %v", err)
+	}
+	if len(comments) != 1 {
+		t.Fatalf("got %d comments, want 1", len(comments))
+	}
+	body := comments[0].Body
+	if strings.Contains(body, srv.URL) {
+		t.Errorf("comment body still points at the remote URL: %s", body)
+	}
+	if !strings.Contains(body, filepath.ToSlash(dir)) {
+		t.Errorf("comment body missing local dir %s: %s", filepath.ToSlash(dir), body)
+	}
+	entries, _ := os.ReadDir(dir)
+	if len(entries) != 1 {
+		t.Fatalf("downloaded %d files, want 1", len(entries))
+	}
+	if filepath.Ext(entries[0].Name()) != ".png" {
+		t.Errorf("downloaded file = %s, want .png extension", entries[0].Name())
+	}
+}
+
+// TestParseCommentsTextSkipsImageDownload: FormatText discards markup, so
+// comment images must not be fetched at all.
+func TestParseCommentsTextSkipsImageDownload(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/pic.png" {
+			t.Error("image fetched despite FormatText")
+			return
+		}
+		imgURL := "http://" + r.Host + "/pic.png"
+		fmt.Fprintf(w, `<html><body><script>Site.page = {"replycount":1,"comments":[{"article":"look: <img src='%s'>","uname":"u1","dname":"User One","talkid":100,"dtalkid":1000,"parent":0,"level":1,"ctime":"January 1 2020, 12:00:00 UTC","ctime_ts":1577836800,"subject":"","userpic":"","deleted":0}]};</script></body></html>`, imgURL)
+	}))
+	defer srv.Close()
+
+	dir := t.TempDir()
+	client := newTestClient(srv.URL)
+	client.baseURL = srv.URL + "/%s"
+	client.ImagesDir = dir
+	client.BodyFormat = FormatText
+
+	comments, err := ParseComments(context.Background(), client, "testuser", 1)
+	if err != nil {
+		t.Fatalf("ParseComments: %v", err)
+	}
+	if len(comments) != 1 {
+		t.Fatalf("got %d comments, want 1", len(comments))
+	}
+	entries, _ := os.ReadDir(dir)
+	if len(entries) != 0 {
+		t.Errorf("no files should be downloaded for FormatText, got %d", len(entries))
+	}
+}
