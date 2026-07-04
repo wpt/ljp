@@ -14,6 +14,7 @@ type selector struct {
 	kind     selectorKind
 	ordinals []int
 	ljIDs    []int
+	dates    []int // fromYear, fromMonth, toYear, toMonth (selDateRange only)
 }
 
 type selectorKind int
@@ -23,6 +24,7 @@ const (
 	selOrdinalRange
 	selLJIDList
 	selLJIDRange
+	selDateRange
 )
 
 func parseSelector(arg string) (*selector, error) {
@@ -54,11 +56,17 @@ func parseSelector(arg string) (*selector, error) {
 		return &selector{kind: selLJIDList, ljIDs: ids}, nil
 	}
 
+	// A slash routes to the date form (YYYY/MM); plain ordinals and @LJ IDs
+	// never contain one, so the grammar stays unambiguous.
+	if strings.Contains(arg, "/") {
+		return parseDateSelector(arg)
+	}
+
 	if strings.Contains(arg, "-") {
 		parts := strings.SplitN(arg, "-", 2)
 		from, err := strconv.Atoi(strings.TrimSpace(parts[0]))
-		if err != nil {
-			return nil, fmt.Errorf("invalid ordinal range start: %s", parts[0])
+		if err != nil || from < 1 {
+			return nil, fmt.Errorf("invalid ordinal range start (ordinals are 1-based): %s", parts[0])
 		}
 		to, err := strconv.Atoi(strings.TrimSpace(parts[1]))
 		if err != nil {
@@ -74,18 +82,59 @@ func parseSelector(arg string) (*selector, error) {
 	var ordinals []int
 	for _, p := range parts {
 		n, err := strconv.Atoi(strings.TrimSpace(p))
-		if err != nil {
-			return nil, fmt.Errorf("invalid ordinal: %s", p)
+		// Reject non-positive ordinals at parse time, like @0 for LJ IDs —
+		// they'd otherwise burn a full index fetch just to warn and exit 0.
+		if err != nil || n < 1 {
+			return nil, fmt.Errorf("invalid ordinal (ordinals are 1-based): %s", p)
 		}
 		ordinals = append(ordinals, n)
 	}
 	return &selector{kind: selOrdinalList, ordinals: ordinals}, nil
 }
 
+// parseDateSelector parses "YYYY/MM" (one month) or "YYYY/MM-YYYY/MM" (an
+// inclusive month range) into a selDateRange selector.
+func parseDateSelector(arg string) (*selector, error) {
+	fromStr, toStr := arg, arg
+	if i := strings.Index(arg, "-"); i >= 0 {
+		fromStr, toStr = arg[:i], arg[i+1:]
+	}
+	fromYear, fromMonth, err := parseYearMonth(fromStr)
+	if err != nil {
+		return nil, err
+	}
+	toYear, toMonth, err := parseYearMonth(toStr)
+	if err != nil {
+		return nil, err
+	}
+	if fromYear*100+fromMonth > toYear*100+toMonth {
+		return nil, fmt.Errorf("inverted date range: %s", arg)
+	}
+	return &selector{kind: selDateRange, dates: []int{fromYear, fromMonth, toYear, toMonth}}, nil
+}
+
+// parseYearMonth parses one "YYYY/MM" bound. Years before LiveJournal existed
+// (1999) are rejected as likely typos.
+func parseYearMonth(s string) (year, month int, err error) {
+	parts := strings.Split(strings.TrimSpace(s), "/")
+	if len(parts) != 2 {
+		return 0, 0, fmt.Errorf("invalid date selector %q (want YYYY/MM)", s)
+	}
+	year, err = strconv.Atoi(parts[0])
+	if err != nil || year < 1999 || year > 2099 {
+		return 0, 0, fmt.Errorf("invalid year in date selector %q (want 1999-2099)", s)
+	}
+	month, err = strconv.Atoi(parts[1])
+	if err != nil || month < 1 || month > 12 {
+		return 0, 0, fmt.Errorf("invalid month in date selector %q (want 01-12)", s)
+	}
+	return year, month, nil
+}
+
 func parseLJID(s string) (int, error) {
 	s = strings.TrimPrefix(strings.TrimSpace(s), "@")
 	n, err := strconv.Atoi(s)
-	if err != nil {
+	if err != nil || n <= 0 {
 		return 0, fmt.Errorf("invalid LJ ID: @%s", s)
 	}
 	return n, nil
@@ -95,6 +144,10 @@ func resolveLJIDs(ctx context.Context, client *lj.Client, user string, sel *sele
 	switch sel.kind {
 	case selLJIDList:
 		return sel.ljIDs, nil
+	case selDateRange:
+		d := sel.dates
+		fmt.Fprintf(os.Stderr, "Building monthly post index %04d/%02d-%04d/%02d...\n", d[0], d[1], d[2], d[3])
+		return lj.FetchMonthlyPostIndex(ctx, client, user, d[0], d[1], d[2], d[3])
 	case selLJIDRange:
 		fmt.Fprintf(os.Stderr, "Building full post index for LJ ID range...\n")
 		index, err := lj.FetchFullPostIndex(ctx, client, user)
@@ -116,10 +169,7 @@ func resolveLJIDs(ctx context.Context, client *lj.Client, user string, sel *sele
 			return nil, err
 		}
 		if sel.kind == selOrdinalRange {
-			from, to := sel.ordinals[0], sel.ordinals[1]
-			if from < 1 {
-				from = 1
-			}
+			from, to := sel.ordinals[0], sel.ordinals[1] // from >= 1, enforced at parse time
 			if from > len(index) {
 				return nil, fmt.Errorf("ordinal #%d out of range (journal has %d indexable posts)", from, len(index))
 			}
