@@ -50,33 +50,39 @@ func makePostWriter(dir string, pretty bool, render bool) (func(*lj.Post) error,
 	}, nil
 }
 
-// writePostFile writes a single post to {dir}/{id}{ext} atomically: encode to
-// a sibling .tmp file, close, then rename. Crash-resilient against a
-// half-written file blocking --resume; not fsynced (program-crash atomicity
-// only, not power-loss durability).
-func writePostFile(dir, ext string, p *lj.Post, pretty, render bool) error {
-	final := filepath.Join(dir, fmt.Sprintf("%d%s", p.ID, ext))
+// writeFileAtomic writes to final via a sibling .tmp file + rename, so a
+// crashed/cancelled run can't leave a half-written file at final. Shared by
+// the per-post writers and the archive index writer so both get identical
+// crash-atomicity. Not fsynced (program-crash atomicity only, not power-loss
+// durability).
+func writeFileAtomic(final string, write func(io.Writer) error) error {
 	tmp := final + ".tmp"
 	f, err := os.Create(tmp)
 	if err != nil {
 		return err
 	}
-	encErr := func() error {
-		if render {
-			return lj.RenderPost(f, p)
-		}
-		return newJSONEncoder(f, pretty).Encode(p)
-	}()
+	writeErr := write(f)
 	closeErr := f.Close()
-	if encErr != nil {
-		_ = os.Remove(tmp)
-		return encErr
+	if writeErr == nil {
+		writeErr = closeErr
 	}
-	if closeErr != nil {
+	if writeErr != nil {
 		_ = os.Remove(tmp)
-		return closeErr
+		return writeErr
 	}
 	return os.Rename(tmp, final)
+}
+
+// writePostFile writes a single post to {dir}/{id}{ext} atomically, so a
+// half-written file can't block --resume.
+func writePostFile(dir, ext string, p *lj.Post, pretty, render bool) error {
+	final := filepath.Join(dir, fmt.Sprintf("%d%s", p.ID, ext))
+	return writeFileAtomic(final, func(w io.Writer) error {
+		if render {
+			return lj.RenderPost(w, p)
+		}
+		return newJSONEncoder(w, pretty).Encode(p)
+	})
 }
 
 func writePost(post *lj.Post, output string, pretty bool, render bool) error {
