@@ -7,7 +7,7 @@ import (
 )
 
 func TestScanExistingPostsMissingDir(t *testing.T) {
-	ids, err := scanExistingPosts(filepath.Join(t.TempDir(), "does-not-exist"))
+	ids, err := scanExistingPosts(filepath.Join(t.TempDir(), "does-not-exist"), ".json")
 	if err != nil {
 		t.Fatalf("missing dir should not error, got: %v", err)
 	}
@@ -17,7 +17,7 @@ func TestScanExistingPostsMissingDir(t *testing.T) {
 }
 
 func TestScanExistingPostsEmpty(t *testing.T) {
-	ids, err := scanExistingPosts(t.TempDir())
+	ids, err := scanExistingPosts(t.TempDir(), ".json")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -54,24 +54,28 @@ func TestScanExistingPostsMixed(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	ids, err := scanExistingPosts(dir)
+	// Only the current output format counts: a .json archive must not suppress
+	// a --render (.html) run, and vice versa.
+	ids, err := scanExistingPosts(dir, ".json")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	want := map[int]bool{1: true, 42: true}
-	if len(ids) != len(want) {
-		t.Fatalf("ids = %v, want %v", ids, want)
-	}
-	for id := range want {
-		if !ids[id] {
-			t.Errorf("missing id %d", id)
-		}
+	if len(ids) != 1 || !ids[1] {
+		t.Errorf("json scan = %v, want {1}", ids)
 	}
 	if ids[7] {
 		t.Error("0-byte file 7.json should not be marked done")
 	}
 	if ids[99] {
 		t.Error("subdir file 99.json should not be marked done")
+	}
+
+	htmlIDs, err := scanExistingPosts(dir, ".html")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(htmlIDs) != 1 || !htmlIDs[42] {
+		t.Errorf("html scan = %v, want {42}", htmlIDs)
 	}
 }
 
@@ -143,6 +147,7 @@ func TestParseSelector(t *testing.T) {
 		kind     selectorKind
 		ordinals []int
 		ljIDs    []int
+		dates    []int
 		wantErr  bool
 	}{
 		{name: "ordinal range", arg: "1-222", kind: selOrdinalRange, ordinals: []int{1, 222}},
@@ -153,6 +158,16 @@ func TestParseSelector(t *testing.T) {
 		{name: "lj id range", arg: "@256-@100000", kind: selLJIDRange, ljIDs: []int{256, 100000}},
 		{name: "bad ordinal", arg: "abc", wantErr: true},
 		{name: "bad lj id", arg: "@abc", wantErr: true},
+		{name: "zero lj id", arg: "@0", wantErr: true},
+		{name: "negative lj id in list", arg: "@0,@5", wantErr: true},
+		{name: "zero ordinal", arg: "0", wantErr: true},
+		{name: "zero ordinal range start", arg: "0-5", wantErr: true},
+		{name: "date single month", arg: "2019/05", kind: selDateRange, dates: []int{2019, 5, 2019, 5}},
+		{name: "date range", arg: "2019/05-2020/01", kind: selDateRange, dates: []int{2019, 5, 2020, 1}},
+		{name: "date inverted", arg: "2020/01-2019/05", wantErr: true},
+		{name: "date bad month", arg: "2019/13", wantErr: true},
+		{name: "date bad year", arg: "19/05", wantErr: true},
+		{name: "date missing month", arg: "2019/", wantErr: true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -186,6 +201,16 @@ func TestParseSelector(t *testing.T) {
 				for i, v := range tt.ljIDs {
 					if sel.ljIDs[i] != v {
 						t.Errorf("ljIDs[%d] = %d, want %d", i, sel.ljIDs[i], v)
+					}
+				}
+			}
+			if tt.dates != nil {
+				if len(sel.dates) != len(tt.dates) {
+					t.Fatalf("dates = %v, want %v", sel.dates, tt.dates)
+				}
+				for i, v := range tt.dates {
+					if sel.dates[i] != v {
+						t.Errorf("dates[%d] = %d, want %d", i, sel.dates[i], v)
 					}
 				}
 			}

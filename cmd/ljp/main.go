@@ -34,6 +34,7 @@ func main() {
 	count := flag.Bool("count", false, "show indexable post count and exit")
 	first := flag.Bool("first", false, "fetch the oldest post")
 	last := flag.Bool("last", false, "fetch the newest post")
+	latest := flag.Int("latest", 0, "fetch the N newest posts")
 	latestWithComments := flag.Int("latest-with-comments", 0, "fetch N newest posts that have comments")
 	concurrency := flag.Int("concurrency", lj.HTTPConcurrency, "max concurrent HTTP connections / fan-out width")
 	format := flag.String("format", "html", "body format: html, markdown, text")
@@ -53,7 +54,9 @@ func main() {
 		fmt.Fprintf(os.Stderr, "  1,33,444        ordinal list\n")
 		fmt.Fprintf(os.Stderr, "  @166511          LJ post ID\n")
 		fmt.Fprintf(os.Stderr, "  @256,@166511     LJ ID list\n")
-		fmt.Fprintf(os.Stderr, "  @256-@100000    LJ ID range\n\n")
+		fmt.Fprintf(os.Stderr, "  @256-@100000    LJ ID range\n")
+		fmt.Fprintf(os.Stderr, "  2019/05         one month (archive pages)\n")
+		fmt.Fprintf(os.Stderr, "  2019/01-2020/06 month range\n\n")
 		fmt.Fprintf(os.Stderr, "Examples:\n")
 		fmt.Fprintf(os.Stderr, "  ljp news                          (all posts, JSONL)\n")
 		fmt.Fprintf(os.Stderr, "  ljp --comments news 1-10          (first 10 with comments)\n")
@@ -62,6 +65,7 @@ func main() {
 		fmt.Fprintf(os.Stderr, "  ljp --count news                  (indexable post count)\n")
 		fmt.Fprintf(os.Stderr, "  ljp --first news                  (oldest post)\n")
 		fmt.Fprintf(os.Stderr, "  ljp --last news                   (newest post)\n")
+		fmt.Fprintf(os.Stderr, "  ljp --latest 5 --dir ./posts news (5 newest posts)\n")
 		fmt.Fprintf(os.Stderr, "  ljp --latest-with-comments 5 --dir ./posts news (5 newest with replies)\n")
 		fmt.Fprintf(os.Stderr, "  ljp --comments --dir ./posts news (all to dir)\n")
 		fmt.Fprintf(os.Stderr, "  ljp --format markdown news/166511  (body as markdown)\n")
@@ -85,45 +89,44 @@ func main() {
 
 	user, id, err := parseArg(flag.Arg(0))
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-		os.Exit(1)
+		fatalf("%v", err)
 	}
 
 	switch *format {
 	case lj.FormatHTML, lj.FormatMarkdown, lj.FormatText:
 		// ok
 	default:
-		fmt.Fprintf(os.Stderr, "Error: --format must be html, markdown, or text (got %q)\n", *format)
-		os.Exit(1)
+		fatalf("--format must be html, markdown, or text (got %q)", *format)
 	}
 	if *concurrency < 1 {
-		fmt.Fprintf(os.Stderr, "Error: --concurrency must be >= 1 (got %d)\n", *concurrency)
-		os.Exit(1)
+		fatalf("--concurrency must be >= 1 (got %d)", *concurrency)
+	}
+	if *latest < 0 {
+		fatalf("--latest must be >= 0 (got %d)", *latest)
 	}
 	if *latestWithComments < 0 {
-		fmt.Fprintf(os.Stderr, "Error: --latest-with-comments must be >= 0 (got %d)\n", *latestWithComments)
-		os.Exit(1)
+		fatalf("--latest-with-comments must be >= 0 (got %d)", *latestWithComments)
 	}
 	modeCount := 0
-	for _, b := range []bool{*count, *first, *last, *latestWithComments > 0} {
+	for _, b := range []bool{*count, *first, *last, *latest > 0, *latestWithComments > 0} {
 		if b {
 			modeCount++
 		}
 	}
 	if modeCount > 1 {
-		fatalf("--count, --first, --last, and --latest-with-comments are mutually exclusive")
+		fatalf("--count, --first, --last, --latest, and --latest-with-comments are mutually exclusive")
 	}
 
 	selectorArg := flag.NArg() > 1
-	// --count/--first/--last take just a username; a selector or explicit post ID
+	// These modes take just a username; a selector or explicit post ID
 	// alongside them is contradictory (and was previously ignored silently).
-	if (*count || *first || *last) && (selectorArg || id != 0) {
-		fatalf("--count/--first/--last take only a username, no selector or post ID")
+	if (*count || *first || *last || *latest > 0 || *latestWithComments > 0) && (selectorArg || id != 0) {
+		fatalf("--count/--first/--last/--latest/--latest-with-comments take only a username, no selector or post ID")
 	}
 
 	// singlePostMode is the one path that writes a single post via -o/stdout. All
 	// other modes fan out through --dir or a stdout stream.
-	singlePostMode := !*count && *latestWithComments == 0 && !selectorArg && (id != 0 || *first || *last)
+	singlePostMode := !*count && *latest == 0 && *latestWithComments == 0 && !selectorArg && (id != 0 || *first || *last)
 
 	if *output != "" && *dir != "" {
 		fatalf("use either -o or --dir, not both")
@@ -148,7 +151,14 @@ func main() {
 	client.ImagesDir = *images
 
 	if *resume && *dir != "" {
-		ids, err := scanExistingPosts(*dir)
+		// Only files in the CURRENT output format count as already done:
+		// {id}.json from an earlier JSON run must not suppress rendering the
+		// same post to HTML (and vice versa).
+		resumeExt := ".json"
+		if *render {
+			resumeExt = ".html"
+		}
+		ids, err := scanExistingPosts(*dir, resumeExt)
 		if err != nil {
 			exit(ctx, fmt.Errorf("scanning resume dir %s: %w", *dir, err))
 		}
@@ -167,8 +177,15 @@ func main() {
 		return
 	}
 
+	if *latest > 0 {
+		runLatest(ctx, client, user, *latest, *comments, *dir, *pretty, *render)
+		maybeWriteArchiveIndex(*render, *dir)
+		return
+	}
+
 	if *latestWithComments > 0 {
 		runLatestWithComments(ctx, client, user, *latestWithComments, *dir, *pretty, *render)
+		maybeWriteArchiveIndex(*render, *dir)
 		return
 	}
 
@@ -196,11 +213,13 @@ func main() {
 			exit(ctx, err)
 		}
 		runSelectionMode(ctx, client, user, sel, *comments, *dir, *pretty, *render)
+		maybeWriteArchiveIndex(*render, *dir)
 		return
 	}
 
 	if id == 0 {
 		runJournalMode(ctx, client, user, *comments, *dir, *pretty, *render)
+		maybeWriteArchiveIndex(*render, *dir)
 		return
 	}
 
@@ -228,9 +247,64 @@ func main() {
 		if err := onPost(post); err != nil {
 			exit(ctx, err)
 		}
+		maybeWriteArchiveIndex(*render, *dir)
 	} else if err := writePost(post, *output, *pretty, *render); err != nil {
 		exit(ctx, err)
 	}
+}
+
+// indexIsComplete reports whether the fast ?skip= index already reaches the
+// journal's oldest surviving post, verified with FindFirstPostID's HEAD
+// probes (a few dozen requests — far cheaper than the 300+-page monthly
+// walk). Errors count as "incomplete" so callers fall back conservatively.
+func indexIsComplete(ctx context.Context, client *lj.Client, user string, index []int) bool {
+	if len(index) == 0 {
+		return false
+	}
+	first, err := lj.FindFirstPostID(ctx, client, user)
+	return err == nil && index[0] <= first // index is ascending; index[0] is its oldest
+}
+
+// runLatest fetches the N newest posts (no has-comments filter — cf.
+// runLatestWithComments) and writes them via the standard parallel fan-out.
+// With --resume, posts among the N already on disk count toward the target
+// rather than pulling older posts in to replace them.
+func runLatest(ctx context.Context, client *lj.Client, user string, n int, comments bool, dir string, pretty bool, render bool) {
+	fmt.Fprintf(os.Stderr, "Building post index...\n")
+	index, err := lj.FetchPostIndex(ctx, client, user)
+	if err != nil {
+		exit(ctx, err)
+	}
+	// The ?skip= index is capped by LJ and truncates the *oldest* posts, so
+	// the newest N are always present while N <= len(index). Beyond that,
+	// first verify completeness cheaply — a genuinely small journal shouldn't
+	// pay for the exhaustive monthly walk — then fall back to it.
+	if n > len(index) && !indexIsComplete(ctx, client, user, index) {
+		fmt.Fprintf(os.Stderr, "Index holds only %d posts and may be truncated; building full index...\n", len(index))
+		index, err = lj.FetchFullPostIndex(ctx, client, user)
+		if err != nil {
+			exit(ctx, err)
+		}
+	}
+	if len(index) == 0 {
+		fmt.Fprintf(os.Stderr, "No posts found\n")
+		return
+	}
+	if n > len(index) {
+		fmt.Fprintf(os.Stderr, "Journal has only %d posts (requested %d)\n", len(index), n)
+		n = len(index)
+	}
+	// index is sorted ascending; take the top N, newest first.
+	ids := make([]int, 0, n)
+	for i := len(index) - 1; i >= len(index)-n; i-- {
+		ids = append(ids, index[i])
+	}
+	ids = filterSkipped(ids, client.SkipIDs)
+	if len(ids) == 0 {
+		return
+	}
+	fmt.Fprintf(os.Stderr, "Fetching %d posts...\n", len(ids))
+	runParallel(ctx, client, user, ids, comments, dir, pretty, render)
 }
 
 func runSelectionMode(ctx context.Context, client *lj.Client, user string, sel *selector, comments bool, dir string, pretty bool, render bool) {
@@ -255,11 +329,15 @@ func runSelectionMode(ctx context.Context, client *lj.Client, user string, sel *
 		if err != nil {
 			exit(ctx, err)
 		}
-		// A single explicitly-selected post: treat a fetch failure as fatal, so
-		// `ljp news @missing` exits non-zero like `ljp news/missing` does, rather
-		// than printing a warning and exiting 0.
+		// A fetch failure is fatal only for a post the user named explicitly
+		// (a one-element @ID or ordinal list), so `ljp news @missing` exits
+		// non-zero like `ljp news/missing` does. Ranges and date selectors
+		// that happen to resolve to a single post keep the bulk
+		// warn-and-continue semantics of their multi-post form.
+		explicitSingle := (sel.kind == selLJIDList && len(sel.ljIDs) == 1) ||
+			(sel.kind == selOrdinalList && len(sel.ordinals) == 1)
 		for _, id := range filtered {
-			if err := fetchAndWrite(ctx, client, user, id, comments, true, onPost); err != nil {
+			if err := fetchAndWrite(ctx, client, user, id, comments, explicitSingle, onPost); err != nil {
 				exit(ctx, err)
 			}
 		}
@@ -281,11 +359,46 @@ func runLatestWithComments(ctx context.Context, client *lj.Client, user string, 
 	if err != nil {
 		exit(ctx, err)
 	}
-	found := 0
+	found := fetchNewestWithComments(ctx, client, user, index, n, 0, onPost)
+
+	// The ?skip= index truncates the oldest posts on large journals. If the
+	// target wasn't met, verify completeness cheaply and continue the same
+	// walk over the truncated tail via the monthly archives — mirroring the
+	// fallback runLatest has, so the two --latest* modes agree on depth.
+	if found < n && ctx.Err() == nil && !indexIsComplete(ctx, client, user, index) {
+		fmt.Fprintf(os.Stderr, "Fast index exhausted at %d posts; walking monthly archives for older posts...\n", len(index))
+		full, err := lj.FetchFullPostIndex(ctx, client, user)
+		if err != nil {
+			exit(ctx, err)
+		}
+		var older []int
+		for _, id := range full {
+			if id < index[0] {
+				older = append(older, id)
+			}
+		}
+		if len(older) > 0 {
+			found = fetchNewestWithComments(ctx, client, user, older, n, found, onPost)
+		}
+	}
+
+	// Distinguish "walked the whole journal, came up short" from "interrupted":
+	// a signal-cancelled context must exit 130, not report a benign shortfall.
+	if ctx.Err() != nil {
+		exit(ctx, ctx.Err())
+	}
+	if found < n {
+		fmt.Fprintf(os.Stderr, "Only found %d posts with comments (requested %d)\n", found, n)
+	}
+}
+
+// fetchNewestWithComments walks ids (ascending) newest→oldest in batches,
+// fetching post+comments in parallel inside a batch, then processing
+// completions in newest-first order so --resume counts and the "stop at N"
+// cutoff stay deterministic. Posts with at least one comment are written via
+// onPost and counted; found is the running total, returned updated.
+func fetchNewestWithComments(ctx context.Context, client *lj.Client, user string, index []int, n, found int, onPost func(*lj.Post) error) int {
 	batchSize := max(1, client.HTTPConcurrency)
-	// Walk newest→oldest in batches; inside a batch, fetch post+comments in
-	// parallel, then process completions in newest-first order so --resume counts
-	// and the "stop at N" cutoff stay deterministic.
 	for i := len(index) - 1; i >= 0 && found < n; {
 		if ctx.Err() != nil {
 			break
@@ -294,8 +407,7 @@ func runLatestWithComments(ctx context.Context, client *lj.Client, user string, 
 		// Collect up to batchSize candidate IDs, skipping resume-counted ones up-front.
 		type slot struct {
 			id   int
-			post *lj.Post
-			done bool
+			post *lj.Post // nil until fetched successfully
 		}
 		var batch []slot
 		// Collect a full concurrency-wide batch even when few posts remain to be
@@ -333,7 +445,6 @@ func runLatestWithComments(ctx context.Context, client *lj.Client, user string, 
 					fmt.Fprintf(os.Stderr, "Warning: comments for %d: %v\n", id, err)
 				}
 				batch[j].post = post
-				batch[j].done = true
 				return nil
 			})
 		}
@@ -344,7 +455,7 @@ func runLatestWithComments(ctx context.Context, client *lj.Client, user string, 
 			if found >= n {
 				break
 			}
-			if !s.done || s.post == nil {
+			if s.post == nil {
 				continue
 			}
 			if len(s.post.Comments) == 0 {
@@ -357,15 +468,7 @@ func runLatestWithComments(ctx context.Context, client *lj.Client, user string, 
 			fmt.Fprintf(os.Stderr, "Progress: %d/%d (post %d, %d comments)\n", found, n, s.id, lj.CountComments(s.post.Comments))
 		}
 	}
-
-	// Distinguish "walked the whole journal, came up short" from "interrupted":
-	// a signal-cancelled context must exit 130, not report a benign shortfall.
-	if ctx.Err() != nil {
-		exit(ctx, ctx.Err())
-	}
-	if found < n {
-		fmt.Fprintf(os.Stderr, "Only found %d posts with comments (requested %d)\n", found, n)
-	}
+	return found
 }
 
 func runJournalMode(ctx context.Context, client *lj.Client, user string, comments bool, dir string, pretty bool, render bool) {
@@ -517,11 +620,12 @@ func newCLILogger(verbose bool) *slog.Logger {
 	return slog.New(slog.NewTextHandler(os.Stderr, opts))
 }
 
-// scanExistingPosts reads a directory for {id}.json or {id}.html files and
-// returns their IDs. Empty files (e.g. from a crashed run) and subdirectories
-// are ignored. A missing directory yields an empty map and no error; any other
-// ReadDir failure is reported so the caller can decide whether to bail.
-func scanExistingPosts(dir string) (map[int]bool, error) {
+// scanExistingPosts reads a directory for {id}{ext} files (ext is the current
+// run's output extension, ".json" or ".html") and returns their IDs. Empty
+// files (e.g. from a crashed run) and subdirectories are ignored. A missing
+// directory yields an empty map and no error; any other ReadDir failure is
+// reported so the caller can decide whether to bail.
+func scanExistingPosts(dir, ext string) (map[int]bool, error) {
 	ids := make(map[int]bool)
 	entries, err := os.ReadDir(dir)
 	if err != nil {
@@ -535,8 +639,7 @@ func scanExistingPosts(dir string) (map[int]bool, error) {
 			continue
 		}
 		name := e.Name()
-		ext := filepath.Ext(name)
-		if ext != ".json" && ext != ".html" {
+		if filepath.Ext(name) != ext {
 			continue
 		}
 		id, err := strconv.Atoi(strings.TrimSuffix(name, ext))

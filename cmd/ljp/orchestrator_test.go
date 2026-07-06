@@ -449,3 +449,122 @@ func TestRunSelectionMode_SingleLJID(t *testing.T) {
 		t.Errorf("got id %d, want 77", p.ID)
 	}
 }
+
+func TestRunLatest(t *testing.T) {
+	srv := newFakeLJServer([]int{1, 2, 3, 4, 5}, nil)
+	defer srv.Close()
+
+	dir := t.TempDir()
+	client := newOrchestratorClient(srv)
+
+	stderr := captureStderr(t, func() {
+		runLatest(context.Background(), client, "testuser", 2, false, dir, false, false)
+	})
+
+	entries, _ := os.ReadDir(dir)
+	got := map[int]bool{}
+	for _, e := range entries {
+		if filepath.Ext(e.Name()) != ".json" {
+			continue
+		}
+		id, _ := strconv.Atoi(strings.TrimSuffix(e.Name(), ".json"))
+		got[id] = true
+	}
+	if len(got) != 2 || !got[4] || !got[5] {
+		t.Errorf("got %v, want {4, 5} (stderr: %s)", got, stderr)
+	}
+}
+
+func TestRunLatestResumeCountsExisting(t *testing.T) {
+	// Post 5 is already on disk (resume). --latest 2 must fetch only post 4 and
+	// NOT reach back to post 3: present posts count toward the target.
+	srv := newFakeLJServer([]int{1, 2, 3, 4, 5}, nil)
+	defer srv.Close()
+
+	dir := t.TempDir()
+	client := newOrchestratorClient(srv)
+	client.SkipIDs = map[int]bool{5: true}
+
+	captureStderr(t, func() {
+		runLatest(context.Background(), client, "testuser", 2, false, dir, false, false)
+	})
+
+	entries, _ := os.ReadDir(dir)
+	var names []string
+	for _, e := range entries {
+		names = append(names, e.Name())
+	}
+	if len(names) != 1 || names[0] != "4.json" {
+		t.Errorf("got %v, want [4.json]", names)
+	}
+}
+
+func TestRunLatestMoreThanJournal(t *testing.T) {
+	// Requesting more posts than the journal holds clamps to the journal size
+	// with a shortfall notice — and, because the fake server 200s every HEAD
+	// probe, FindFirstPostID proves the fast index complete, so the
+	// 300+-page monthly-walk fallback must NOT run.
+	srv := newFakeLJServer([]int{1, 2, 3}, nil)
+	defer srv.Close()
+
+	dir := t.TempDir()
+	client := newOrchestratorClient(srv)
+
+	stderr := captureStderr(t, func() {
+		runLatest(context.Background(), client, "testuser", 10, false, dir, false, false)
+	})
+
+	entries, _ := os.ReadDir(dir)
+	jsonCount := 0
+	for _, e := range entries {
+		if filepath.Ext(e.Name()) == ".json" {
+			jsonCount++
+		}
+	}
+	if jsonCount != 3 {
+		t.Errorf("got %d posts, want 3 (stderr: %s)", jsonCount, stderr)
+	}
+	// Assert the exact clamp message — a bare "only 3 posts" substring would
+	// also match the full-index fallback notice and prove nothing.
+	if !strings.Contains(stderr, "Journal has only 3 posts (requested 10)") {
+		t.Errorf("expected shortfall notice in stderr: %s", stderr)
+	}
+	if strings.Contains(stderr, "building full index") {
+		t.Errorf("complete index should not trigger the monthly-walk fallback: %s", stderr)
+	}
+}
+
+func TestRunSelectionMode_DateRangeSingleMissingIsWarning(t *testing.T) {
+	// A date selector resolving to exactly one post whose fetch 404s must be a
+	// per-post warning (bulk semantics), not a fatal exit — fatalOnError is
+	// reserved for posts the user named explicitly (@ID / single ordinal).
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/2019/05/") {
+			fmt.Fprint(w, `<html><body><a href="/999.html">deleted post</a></body></html>`)
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer srv.Close()
+	client := lj.NewClient()
+	client.SetBaseURL(srv.URL + "/%s")
+	client.SetConcurrency(2)
+
+	sel, err := parseSelector("2019/05")
+	if err != nil {
+		t.Fatalf("parseSelector: %v", err)
+	}
+	dir := t.TempDir()
+	stderr := captureStderr(t, func() {
+		// Must return normally; a fatalOnError regression would os.Exit(1) here
+		// and abort the whole test binary.
+		runSelectionMode(context.Background(), client, "testuser", sel, false, dir, false, false)
+	})
+	if !strings.Contains(stderr, "Warning: post 999") {
+		t.Errorf("expected per-post warning, stderr: %s", stderr)
+	}
+	entries, _ := os.ReadDir(dir)
+	if len(entries) != 0 {
+		t.Errorf("no files should be written, got %d", len(entries))
+	}
+}
