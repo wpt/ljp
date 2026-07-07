@@ -27,6 +27,7 @@ In examples below, `news` is a LiveJournal username (the official news journal) 
 # Single post (by ID or URL)
 ljp news/166511
 ljp https://news.livejournal.com/166511.html
+ljp https://users.livejournal.com/_user_/12345.html   # underscore usernames
 
 # With comments, saved to a file
 ljp --comments -o post.json news/166511
@@ -40,6 +41,8 @@ ljp news 1,5,100                 # specific posts
 ljp news @166511                 # by LJ ID
 ljp news @256,@166511            # multiple LJ IDs
 ljp news @256-@100000            # LJ ID range
+ljp news 2019/05                 # one month (archive pages)
+ljp news 2019/01-2020/06         # month range
 
 # Journal info
 ljp --count news                 # indexable post count
@@ -49,6 +52,7 @@ ljp --last news                  # newest post
 # Bulk archive — typical workflow
 ljp --comments --images ./img --dir ./posts news     # posts + comments + local images
 ljp --resume   --dir ./posts news                    # resume an interrupted run
+ljp --latest 5 --dir ./posts news                    # 5 newest posts
 ljp --latest-with-comments 5 --dir ./posts news      # 5 newest posts that have replies
 ljp --concurrency 20 --dir ./posts news              # gentler parallelism (default 40)
 
@@ -59,7 +63,7 @@ ljp --images ./img news/166511                       # download images, rewrite 
 
 # Render as a styled, self-contained HTML page with threaded comments
 ljp --render --comments -o post.html news/166511
-ljp --render --comments --dir ./posts news           # one {id}.html per post
+ljp --render --comments --dir ./posts news           # one {id}.html per post + index.html
 
 # Verbose (debug) logging to stderr
 ljp -v news/166511
@@ -73,11 +77,12 @@ ljp -v news/166511
 | `--count` | Show indexable post count and exit |
 | `--first` | Fetch the oldest post (HEAD-probe + binary search) |
 | `--last` | Fetch the newest post |
+| `--latest <N>` | Fetch the N newest posts |
 | `--latest-with-comments <N>` | Fetch the N newest posts that have at least one comment |
-| `--format html\|markdown\|text` | Body format (default: html) |
-| `--images <dir>` | Download images to directory and rewrite `<img src>` to local paths |
-| `--render` | Output as a self-contained HTML page (use with `-o` or `--dir`) |
-| `--resume` | Skip posts already in `--dir` (matches `{id}.json` or `{id}.html`) |
+| `--format html\|markdown\|text` | Body format, applied to post and comment bodies (default: html) |
+| `--images <dir>` | Download images (from post and comment bodies) to directory and rewrite `<img src>` to local paths |
+| `--render` | Output as a self-contained HTML page (use with `-o` or `--dir`; with `--dir` also writes an `index.html` table of contents) |
+| `--resume` | Skip posts already in `--dir` in the current output format (`{id}.html` with `--render`, else `{id}.json`) |
 | `--concurrency <N>` | Max concurrent HTTP connections / fan-out width (default 40) |
 | `--pretty` | Pretty-print JSON (default true; pass `--pretty=false` for compact) |
 | `-o <file>` | Output to file (default: stdout) |
@@ -93,7 +98,7 @@ relative to that directory, not to each `{id}.html` file.
 
 ## Output
 
-Single post: pretty JSON to stdout. Multiple posts (without `--dir`): JSONL — pretty-printed by default; pass `--pretty=false` for one compact object per line. With `--dir`, each post becomes `{dir}/{id}.json` (or `{id}.html` with `--render`).
+Single post: pretty JSON to stdout. Multiple posts (without `--dir`): JSONL — pretty-printed by default; pass `--pretty=false` for one compact object per line. With `--dir`, each post becomes `{dir}/{id}.json` (or `{id}.html` with `--render`; a browsable `{dir}/index.html` listing every saved post, newest first, is regenerated after each completed run).
 
 ```json
 {
@@ -161,6 +166,7 @@ _, _ = lj.FindFirstPostID(ctx, client, "news") // oldest post (HEAD-probe + bina
 _, _ = lj.FindLastPostID(ctx, client, "news")  // newest post
 _, _ = lj.FetchPostIndex(ctx, client, "news")  // ?skip= pages, fast but caps at LJ's index limit
 _, _ = lj.FetchFullPostIndex(ctx, client, "news") // monthly archives, exhaustive
+_, _ = lj.FetchMonthlyPostIndex(ctx, client, "news", 2019, 5, 2019, 6) // archives for May-June 2019
 
 // Stream all posts with a callback (sequential — for parallel use FetchFullPostIndex + ParsePost yourself).
 if err := lj.ParseJournal(ctx, client, "news", true, func(p *lj.Post) error {

@@ -21,9 +21,10 @@
 // # Image download
 //
 // Set [Client.ImagesDir] to a writable directory and ParsePost will fetch
-// every http(s) <img src> in the post body to {dir}/{sha256_16hex}.{ext},
-// rewriting src to the local path. data:/javascript:/vbscript: URIs and
-// non-http(s) URLs are skipped.
+// every http(s) <img src> in the post body — and ParseComments in every
+// comment body — to {dir}/{sha256_16hex}.{ext}, rewriting src to the local
+// path. Skipped for [FormatText], where the rewritten src would be discarded.
+// data:/javascript:/vbscript: URIs and non-http(s) URLs are skipped.
 //
 // # Body format
 //
@@ -33,7 +34,9 @@
 //
 // # Indexing strategies
 //
-// Two complementary index walkers. [FetchPostIndex] paginates ?skip=N — fast,
-// but LJ caps these and very old posts get truncated. [FetchFullPostIndex]
-// walks /YYYY/MM/ monthly archives 1999..now — slower, exhaustive, parallel.
+// Three index walkers. [FetchPostIndex] paginates ?skip=N — fast, but LJ caps
+// these and very old posts get truncated. [FetchFullPostIndex] walks /YYYY/MM/
+// monthly archives 1999..now — slower, exhaustive, parallel, tolerant of
+// individual failed months. [FetchMonthlyPostIndex] walks an explicit month
+// range and errors if any requested month fails to fetch.
 package lj
