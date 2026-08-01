@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"regexp"
 	"strconv"
 	"strings"
 	"testing"
@@ -135,6 +136,68 @@ func captureStderr(t *testing.T, fn func()) string {
 	fn()
 	_ = w.Close()
 	return <-done
+}
+
+// TestRenderedArchiveImagesResolve is the end-to-end assertion the unit tests
+// can only approximate: take the src actually written into posts/{id}.html,
+// resolve it the way a browser does — relative to that file's own directory —
+// and require it to name a file that exists. This is what `ljp --render
+// --images ./img --dir ./posts` has to satisfy to be browsable offline.
+func TestRenderedArchiveImagesResolve(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/pic.jpg") {
+			w.Header().Set("Content-Type", "image/jpeg")
+			w.Write([]byte("FAKE_IMAGE"))
+			return
+		}
+		fmt.Fprintf(w, `<html><head><meta property="og:title" content="p"/></head><body>
+<h1 class="aentry-post__title">Post 42</h1>
+<time>January 1 2020, 12:00</time>
+<div class="aentry-post__text aentry-post__text--view">
+<p>Body</p><img src="http://%s/pic.jpg">
+</div>
+</body></html>`, r.Host)
+	}))
+	defer srv.Close()
+
+	t.Chdir(t.TempDir())
+
+	client := lj.NewClient()
+	client.SetBaseURL(srv.URL + "/%s")
+	// Exactly what main() wires up for `--images ./img --dir ./posts`.
+	client.ImagesDir = "img"
+	client.ImagesRef = imagesRefFor("img", "posts", "")
+
+	post, err := lj.ParsePost(context.Background(), client, "testuser", 42)
+	if err != nil {
+		t.Fatalf("ParsePost: %v", err)
+	}
+	onPost, err := makePostWriter("posts", false, true) // render=true
+	if err != nil {
+		t.Fatalf("makePostWriter: %v", err)
+	}
+	if err := onPost(post); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	page, err := os.ReadFile(filepath.Join("posts", "42.html"))
+	if err != nil {
+		t.Fatalf("reading rendered post: %v", err)
+	}
+	m := regexp.MustCompile(`<img[^>]+src="([^"]+)"`).FindSubmatch(page)
+	if m == nil {
+		t.Fatalf("no <img src> survived rendering:\n%s", page)
+	}
+	src := string(m[1])
+	if strings.Contains(src, "://") {
+		t.Fatalf("src was never localised, still remote: %q", src)
+	}
+	// Resolve like a browser: relative to the document, i.e. posts/.
+	resolved := filepath.Join("posts", filepath.FromSlash(src))
+	if _, err := os.Stat(resolved); err != nil {
+		t.Errorf("src %q resolved from posts/ is %q, which does not exist: %v",
+			src, resolved, err)
+	}
 }
 
 func TestRunParallel(t *testing.T) {

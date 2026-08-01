@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -110,6 +111,65 @@ func TestGetRetryOn429(t *testing.T) {
 	resp.Body.Close()
 	if got := n.Load(); got != 2 {
 		t.Errorf("requests = %d, want 2 (429 then 200)", got)
+	}
+}
+
+// roundTripFunc drives Client.do's retry loop directly. A httptest server can't
+// express this case: net/http transparently re-sends an idempotent request when
+// a *reused* connection dies before any response bytes arrive, so a server-side
+// abort is swallowed by the Transport and never surfaces as the transport error
+// the retry loop is supposed to see.
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+// TestRetryAfterDoesNotPersistPastTransportError: a Retry-After applies to the
+// response that carried it. Only 5xx/429 responses refresh the stored value, so
+// without an explicit reset a transport error inherits the previous hint and
+// every remaining attempt pays it — turning the 1/2/4/8ms ladder into seconds.
+func TestRetryAfterDoesNotPersistPastTransportError(t *testing.T) {
+	var n atomic.Int32
+	rt := roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		switch n.Add(1) {
+		case 1:
+			h := http.Header{}
+			h.Set("Retry-After", "30")
+			return &http.Response{StatusCode: 429, Header: h, Body: http.NoBody, Request: r}, nil
+		case 2:
+			return nil, errors.New("simulated transport failure")
+		default:
+			return &http.Response{StatusCode: 200, Header: http.Header{}, Body: http.NoBody, Request: r}, nil
+		}
+	})
+	// Record the ladder instead of sleeping it: the delays are the behaviour
+	// under test, and a wall-clock assertion would have to pay a real
+	// Retry-After second on every run of every OS in the matrix.
+	var delays []time.Duration
+	c := &Client{
+		http:         &http.Client{Transport: rt},
+		baseURL:      "http://example.invalid/%s",
+		retryBackoff: time.Millisecond,
+		sleep: func(_ context.Context, d time.Duration) error {
+			delays = append(delays, d)
+			return nil
+		},
+	}
+
+	resp, err := c.Get(context.Background(), "http://example.invalid/")
+	if err != nil {
+		t.Fatalf("want success on the third attempt: %v", err)
+	}
+	resp.Body.Close()
+
+	// After the 429 the server's own hint wins over the 1ms ladder step; after
+	// the transport error, which carries no hint, the ladder must resume at its
+	// second step. Leaking the 30s across would be the regression.
+	want := []time.Duration{30 * time.Second, 2 * time.Millisecond}
+	if !slices.Equal(delays, want) {
+		t.Errorf("retry delays = %v, want %v", delays, want)
+	}
+	if got := n.Load(); got != 3 {
+		t.Errorf("attempts = %d, want 3 (429, transport error, 200)", got)
 	}
 }
 

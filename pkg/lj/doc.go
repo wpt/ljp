@@ -26,6 +26,12 @@
 // path. Skipped for [FormatText], where the rewritten src would be discarded.
 // data:/javascript:/vbscript: URIs and non-http(s) URLs are skipped.
 //
+// [Client.ImagesDir] says where bytes are written; [Client.ImagesRef] says what
+// prefix goes into the rewritten src, and defaults to ImagesDir. Set ImagesRef
+// whenever you save the body somewhere other than the working directory — a
+// browser resolves a relative src against the document's own URL, so a body
+// written to posts/123.html with images in img/ needs ImagesRef "../img".
+//
 // # Body format
 //
 // [Client.BodyFormat] controls the Body field on [Post]: one of [FormatHTML]

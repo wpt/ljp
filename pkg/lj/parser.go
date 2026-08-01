@@ -380,7 +380,7 @@ var imageExtAllowlist = func() map[string]bool {
 }()
 
 // downloadImages finds all <img src> in HTML, downloads images concurrently
-// into client.ImagesDir, and rewrites src to the local filesystem path so the
+// into client.ImagesDir, and rewrites src to client.imagesRef()/{name} so the
 // resulting HTML resolves to the downloaded copy when opened in a browser.
 // Skips data:/javascript:/vbscript: URIs and non-http(s) URLs so they don't
 // burn retries against an unsupported scheme.
@@ -552,7 +552,9 @@ func downloadImages(ctx context.Context, client *Client, html string) string {
 			continue
 		}
 		okCount++
-		newSrc := filepath.ToSlash(filepath.Join(client.ImagesDir, jobs[i].filename))
+		// imagesRef, not ImagesDir: the src has to resolve relative to wherever
+		// this body gets saved, which only the caller knows (see Client.ImagesRef).
+		newSrc := filepath.ToSlash(filepath.Join(client.imagesRef(), jobs[i].filename))
 		for _, sel := range jobs[i].sels {
 			sel.SetAttr("src", newSrc)
 		}

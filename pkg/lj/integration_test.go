@@ -315,6 +315,63 @@ func TestDownloadImagesContentTypeFixesExtension(t *testing.T) {
 	}
 }
 
+// TestDownloadImagesRefPrefix covers the case every other image test misses:
+// a *relative* ImagesDir. Browsers resolve a relative src against the document
+// URL, not the cwd of whatever wrote it, so a body destined for posts/{id}.html
+// must carry "../img/x.jpg", not "img/x.jpg". ImagesRef carries that prefix;
+// the file still lands under ImagesDir either way.
+func TestDownloadImagesRefPrefix(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "image/jpeg")
+		w.Write([]byte("FAKE"))
+	}))
+	defer srv.Close()
+
+	t.Chdir(t.TempDir())
+	client := newTestClient(srv.URL)
+	client.ImagesDir = "img"    // where bytes are written, relative to cwd
+	client.ImagesRef = "../img" // how posts/{id}.html must refer to them
+
+	html := fmt.Sprintf(`<img src="%s/photo.jpg">`, srv.URL)
+	result := downloadImages(context.Background(), client, html)
+
+	if !strings.Contains(result, `src="../img/`) {
+		t.Errorf("src not written relative to the document dir: %s", result)
+	}
+	if strings.Contains(result, `src="img/`) {
+		t.Errorf("src still cwd-relative (the bug): %s", result)
+	}
+	// The prefix must not affect where bytes actually land.
+	entries, err := os.ReadDir("img")
+	if err != nil || len(entries) != 1 {
+		t.Fatalf("ReadDir(img) = %v entries, err=%v; want 1 file under ImagesDir", len(entries), err)
+	}
+	// And the src must point at the file that exists, once resolved from posts/.
+	name := entries[0].Name()
+	if !strings.Contains(result, "../img/"+name) {
+		t.Errorf("src does not name the downloaded file %s: %s", name, result)
+	}
+}
+
+// TestDownloadImagesRefDefaultsToDir pins the back-compat path: library users
+// who never set ImagesRef keep the old ImagesDir-relative behaviour.
+func TestDownloadImagesRefDefaultsToDir(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "image/jpeg")
+		w.Write([]byte("FAKE"))
+	}))
+	defer srv.Close()
+
+	t.Chdir(t.TempDir())
+	client := newTestClient(srv.URL)
+	client.ImagesDir = "img" // ImagesRef deliberately left empty
+
+	result := downloadImages(context.Background(), client, fmt.Sprintf(`<img src="%s/p.jpg">`, srv.URL))
+	if !strings.Contains(result, `src="img/`) {
+		t.Errorf("empty ImagesRef should fall back to ImagesDir: %s", result)
+	}
+}
+
 func TestDownloadImagesSkipsDataURI(t *testing.T) {
 	// data: URIs would otherwise burn maxRetries x exponential backoff against
 	// an unsupported scheme. Test that they're filtered out before any GET.

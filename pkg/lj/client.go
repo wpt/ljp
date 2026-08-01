@@ -76,10 +76,24 @@ type Client struct {
 	http         *http.Client
 	baseURL      string
 	retryBackoff time.Duration
-	Logger       *slog.Logger // progress logger, nil = silent
-	BodyFormat   string       // "html" (default), "markdown", "text"
-	ImagesDir    string       // download images to this dir, empty = skip
-	SkipIDs      map[int]bool // skip these post IDs (for resume)
+	// sleep waits out one retry delay; nil means a real timer. A test seam like
+	// retryBackoff and baseURL: it lets the retry ladder be asserted on exactly,
+	// instead of inferring it from elapsed wall-clock time (a Retry-After is
+	// whole seconds at the finest, so honouring one otherwise costs a real
+	// second per run and gets fuzzy under a loaded CI runner).
+	sleep func(ctx context.Context, d time.Duration) error
+
+	Logger     *slog.Logger // progress logger, nil = silent
+	BodyFormat string       // "html" (default), "markdown", "text"
+	ImagesDir  string       // download images to this dir, empty = skip
+	SkipIDs    map[int]bool // skip these post IDs (for resume)
+	// ImagesRef is the path prefix written into rewritten <img src> values.
+	// Empty means "use ImagesDir". Set it whenever the resulting HTML is saved
+	// somewhere other than the process working directory: a browser resolves a
+	// relative src against the *document's* own URL, never against the cwd of
+	// whatever produced it, so a body saved to posts/123.html needs a prefix
+	// relative to posts/ (e.g. "../img"), not to cwd ("img").
+	ImagesRef string
 	// HTTPConcurrency is the fan-out width for parallel post/comment-page/
 	// image fetches AND the Transport's MaxConnsPerHost. Use SetConcurrency
 	// to mutate this safely — direct assignment changes only the errgroup
@@ -135,6 +149,15 @@ func (c *Client) log() *slog.Logger {
 		return discardLogger
 	}
 	return c.Logger
+}
+
+// imagesRef returns the prefix to write into rewritten <img src> values,
+// defaulting to ImagesDir when the caller hasn't decoupled the two.
+func (c *Client) imagesRef() string {
+	if c.ImagesRef != "" {
+		return c.ImagesRef
+	}
+	return c.ImagesDir
 }
 
 // effectiveFormat normalizes BodyFormat to one of the three known values:
@@ -229,12 +252,8 @@ func (c *Client) do(ctx context.Context, method, url string) (*http.Response, er
 				delay = retryAfter
 			}
 			log.Debug("retrying", "url", url, "attempt", attempt+1, "delay", delay, "prev_err", lastErr)
-			timer := time.NewTimer(delay)
-			select {
-			case <-timer.C:
-			case <-ctx.Done():
-				timer.Stop()
-				return nil, ctx.Err()
+			if err := c.wait(ctx, delay); err != nil {
+				return nil, err
 			}
 		}
 
@@ -252,6 +271,11 @@ func (c *Client) do(ctx context.Context, method, url string) (*http.Response, er
 				return nil, ctx.Err()
 			}
 			lastErr = err
+			// A Retry-After from an earlier 429/5xx applies to that response
+			// only. Transport errors carry no such hint, so drop the stale one
+			// instead of letting a single "Retry-After: 60" stretch every
+			// remaining attempt (4 minutes instead of the 1/2/4/8s ladder).
+			retryAfter = 0
 			continue
 		}
 
@@ -267,6 +291,22 @@ func (c *Client) do(ctx context.Context, method, url string) (*http.Response, er
 		return resp, nil
 	}
 	return nil, fmt.Errorf("after %d attempts: %w", maxRetries, lastErr)
+}
+
+// wait blocks for d, or returns ctx.Err() as soon as the caller cancels.
+// Routed through the Client so tests can substitute Client.sleep.
+func (c *Client) wait(ctx context.Context, d time.Duration) error {
+	if c.sleep != nil {
+		return c.sleep(ctx, d)
+	}
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 // drainAndClose reads up to a few KB of an unwanted response body before closing

@@ -149,6 +149,7 @@ func main() {
 	client.Logger = newCLILogger(*verbose)
 	client.BodyFormat = *format
 	client.ImagesDir = *images
+	client.ImagesRef = imagesRefFor(*images, *dir, *output)
 
 	if *resume && *dir != "" {
 		// Only files in the CURRENT output format count as already done:
@@ -251,6 +252,43 @@ func main() {
 	} else if err := writePost(post, *output, *pretty, *render); err != nil {
 		exit(ctx, err)
 	}
+}
+
+// imagesRefFor computes the prefix for rewritten <img src> values so they
+// resolve against the saved post file rather than the working directory.
+// Posts land in --dir, or next to -o, or (streaming to stdout) nowhere in
+// particular — in that last case cwd-relative is the only meaningful answer
+// and we leave the prefix at ImagesDir by returning "".
+//
+// Both paths go through filepath.Abs before filepath.Rel, which refuses a mixed
+// absolute/relative pair. Either mix is reachable: --images /srv/img --dir
+// ./posts and --images ./img --dir /srv/posts. Rel'ing them is not cosmetic —
+// keeping ImagesDir verbatim would emit a cwd-relative src into a file that
+// isn't in the cwd (the exact bug ImagesRef exists to fix), and on Windows an
+// absolute ImagesDir emits "C:/img/x.jpg", whose "C:" a browser reads as a URL
+// scheme. Only paths on different Windows volumes have no relative form; there
+// "" (keep ImagesDir) is the least-wrong answer left.
+func imagesRefFor(images, dir, output string) string {
+	if images == "" {
+		return ""
+	}
+	docDir := dir
+	if docDir == "" && output != "" {
+		docDir = filepath.Dir(output)
+	}
+	if docDir == "" {
+		return ""
+	}
+	absDoc, docErr := filepath.Abs(docDir)
+	absImages, imgErr := filepath.Abs(images)
+	if docErr != nil || imgErr != nil {
+		return ""
+	}
+	rel, err := filepath.Rel(absDoc, absImages)
+	if err != nil {
+		return ""
+	}
+	return rel
 }
 
 // indexIsComplete reports whether the fast ?skip= index already reaches the

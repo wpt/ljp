@@ -6,6 +6,73 @@ import (
 	"testing"
 )
 
+func TestImagesRefFor(t *testing.T) {
+	cases := []struct {
+		name                string
+		images, dir, output string
+		want                string
+	}{
+		// The documented recipe: `--images ./img --dir ./posts`. posts/{id}.html
+		// must reach up and over, or every image 404s in the browser.
+		{"sibling dirs", "img", "posts", "", filepath.FromSlash("../img")},
+		{"dotted sibling", "./img", "./posts", "", filepath.FromSlash("../img")},
+		// Images nested inside the output dir resolve straight down.
+		{"nested in dir", filepath.Join("posts", "img"), "posts", "", "img"},
+		// Same dir for both: no prefix at all.
+		{"same dir", "posts", "posts", "", "."},
+		// -o names a file; the document dir is its parent.
+		{"output file", "img", "", filepath.Join("out", "p.html"), filepath.FromSlash("../img")},
+		{"output in cwd", "img", "", "p.html", "img"},
+		// Streaming to stdout: no document location, so cwd-relative is all
+		// that's meaningful — "" means "fall back to ImagesDir".
+		{"stdout stream", "img", "", "", ""},
+		// No --images at all.
+		{"no images", "", "posts", "", ""},
+		// --dir wins over -o (they're mutually exclusive anyway).
+		{"dir beats output", "img", "posts", filepath.Join("out", "p.html"), filepath.FromSlash("../img")},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := imagesRefFor(tc.images, tc.dir, tc.output); got != tc.want {
+				t.Errorf("imagesRefFor(%q, %q, %q) = %q, want %q",
+					tc.images, tc.dir, tc.output, got, tc.want)
+			}
+		})
+	}
+}
+
+// Either side of the pair can be absolute while the other is relative — both
+// mixes come straight off the command line, and filepath.Rel refuses such a
+// pair outright. Falling back to a cwd-relative ImagesDir there would reproduce
+// the very bug ImagesRef exists to fix, so imagesRefFor absolutises first.
+func TestImagesRefForMixedAbsolute(t *testing.T) {
+	t.Chdir(t.TempDir())
+	// Not t.TempDir() directly: on macOS it hands back a /var symlink while
+	// filepath.Abs resolves through to /private/var, and the two wouldn't
+	// relativise against each other.
+	cwd, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("getwd: %v", err)
+	}
+	want := filepath.FromSlash("../img")
+
+	t.Run("absolute images, relative dir", func(t *testing.T) {
+		if got := imagesRefFor(filepath.Join(cwd, "img"), "posts", ""); got != want {
+			t.Errorf("imagesRefFor(abs img, %q, \"\") = %q, want %q", "posts", got, want)
+		}
+	})
+	t.Run("relative images, absolute dir", func(t *testing.T) {
+		if got := imagesRefFor("img", filepath.Join(cwd, "posts"), ""); got != want {
+			t.Errorf("imagesRefFor(%q, abs dir, \"\") = %q, want %q", "img", got, want)
+		}
+	})
+	t.Run("both absolute", func(t *testing.T) {
+		if got := imagesRefFor(filepath.Join(cwd, "img"), filepath.Join(cwd, "posts"), ""); got != want {
+			t.Errorf("imagesRefFor(abs, abs, \"\") = %q, want %q", got, want)
+		}
+	})
+}
+
 func TestScanExistingPostsMissingDir(t *testing.T) {
 	ids, err := scanExistingPosts(filepath.Join(t.TempDir(), "does-not-exist"), ".json")
 	if err != nil {

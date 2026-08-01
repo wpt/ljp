@@ -92,9 +92,12 @@ ljp -v news/166511
 
 Run `ljp -h` for the full list.
 
-When combining `--render`, `--dir`, and `--images`, run your browser from the
-working directory you invoked `ljp` in — downloaded `<img src>` paths are written
-relative to that directory, not to each `{id}.html` file.
+With `--images`, the rewritten `<img src>` paths are relative to wherever the
+post files land — the `--dir` directory, or the directory holding the `-o` file
+— so `ljp --render --images ./img --dir ./posts news` produces an archive you
+can browse by opening any `posts/{id}.html` directly, and the whole tree stays
+valid if you move or copy it. Streaming to stdout has no output directory, so
+there the paths stay relative to the working directory instead.
 
 ## Output
 
@@ -148,6 +151,9 @@ client.Logger = slog.New(slog.NewTextHandler(os.Stderr, nil))
 // Options — set BEFORE the first fetch; they're read inside ParsePost.
 client.BodyFormat = lj.FormatMarkdown // FormatHTML (default), FormatMarkdown, FormatText
 client.ImagesDir = "./images"         // download images locally
+// Only if you save the body somewhere other than the working directory: the
+// prefix written into <img src>, relative to that file. Defaults to ImagesDir.
+client.ImagesRef = "../images"        // e.g. body destined for ./posts/{id}.html
 ctx := context.Background()
 
 // Single post + comments
