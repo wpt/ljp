@@ -31,5 +31,5 @@ jobs:
           go-version-file: go.mod
       - name: Install staticcheck
         # Pinned so a new staticcheck release can't fail CI with zero code changes.
-        run: go install honnef.co/go/tools/cmd/staticcheck@v0.7.0
+        run: go install honnef.co/go/tools/cmd/staticcheck@v0.8.1
       - run: staticcheck ./...
