@@ -4,7 +4,7 @@
 [![Go Reference](https://pkg.go.dev/badge/github.com/wpt/ljp/pkg/lj.svg)](https://pkg.go.dev/github.com/wpt/ljp/pkg/lj)
 [![Go Report Card](https://goreportcard.com/badge/github.com/wpt/ljp)](https://goreportcard.com/report/github.com/wpt/ljp)
 
-Archive public LiveJournal journals — posts, threaded comments, and inline images — to local JSON or browsable HTML. No login required. Resumable. Fetches in parallel (40 connections by default). Useful for backing up a journal before deletion, offline reading, or text analysis.
+Archive public LiveJournal journals — posts, threaded comments, and inline images — to local JSON or browsable HTML. No login required. Resumable. Fetches in parallel (30 connections by default). Useful for backing up a journal before deletion, offline reading, or text analysis.
 
 Ships a CLI plus a Go library:
 
@@ -54,7 +54,7 @@ ljp --comments --images ./img --dir ./posts news     # posts + comments + local 
 ljp --resume   --dir ./posts news                    # resume an interrupted run
 ljp --latest 5 --dir ./posts news                    # 5 newest posts
 ljp --latest-with-comments 5 --dir ./posts news      # 5 newest posts that have replies
-ljp --concurrency 20 --dir ./posts news              # gentler parallelism (default 40)
+ljp --concurrency 10 --dir ./posts news              # gentler parallelism (default 30)
 
 # Format & images
 ljp --format markdown news/166511                    # body as Markdown
@@ -83,7 +83,7 @@ ljp -v news/166511
 | `--images <dir>` | Download images (from post and comment bodies) to directory and rewrite `<img src>` to local paths |
 | `--render` | Output as a self-contained HTML page (use with `-o` or `--dir`; with `--dir` also writes an `index.html` table of contents) |
 | `--resume` | Skip posts already in `--dir` in the current output format (`{id}.html` with `--render`, else `{id}.json`) |
-| `--concurrency <N>` | Max concurrent HTTP connections / fan-out width (default 40) |
+| `--concurrency <N>` | Max concurrent HTTP connections / fan-out width (default 30) |
 | `--pretty` | Pretty-print JSON (default true; pass `--pretty=false` for compact) |
 | `-o <file>` | Output to file (default: stdout) |
 | `--dir <dir>` | Output directory (one `{id}.json` or `{id}.html` per post) |

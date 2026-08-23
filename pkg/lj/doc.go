@@ -13,8 +13,8 @@
 //
 // One knob, [Client.HTTPConcurrency], drives the Transport's per-host
 // connection pool AND the errgroup fan-out for parallel post/comment-page/
-// image fetches. The default 40 is calibrated against LiveJournal's tolerance
-// curve. Call [Client.SetConcurrency] to retune both in lockstep — direct
+// image fetches. The default 30 sits under LiveJournal's throttling threshold
+// for sustained runs. Call [Client.SetConcurrency] to retune both in lockstep — direct
 // field assignment changes only the errgroup width and leaves the Transport
 // pool stale.
 //

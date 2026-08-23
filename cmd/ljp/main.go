@@ -72,7 +72,7 @@ func main() {
 		fmt.Fprintf(os.Stderr, "  ljp --images ./img news/166511     (download images)\n")
 		fmt.Fprintf(os.Stderr, "  ljp --resume --dir ./posts news   (skip existing)\n")
 		fmt.Fprintf(os.Stderr, "  ljp --render --comments news/166511 (view as HTML)\n")
-		fmt.Fprintf(os.Stderr, "  ljp --concurrency 40 --dir ./posts news (tune parallelism)\n\n")
+		fmt.Fprintf(os.Stderr, "  ljp --concurrency 10 --dir ./posts news (tune parallelism)\n\n")
 		flag.PrintDefaults()
 	}
 	flag.Parse()

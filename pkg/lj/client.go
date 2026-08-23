@@ -48,13 +48,15 @@ func (e *StatusError) Error() string {
 var tmpCounter atomic.Uint64
 
 // HTTPConcurrency is the default cap on simultaneous connections to one host,
-// also used as the default fan-out width for parallel page/post fetches. 40 is
-// the sweet spot from empirical sweep on LJ: at the knee of the latency curve,
-// well clear of LJ's throttling threshold. NewClient copies this into
-// Client.HTTPConcurrency at construction time; call Client.SetConcurrency to
-// change the limit at runtime (direct field assignment leaves the underlying
-// Transport pool stale).
-var HTTPConcurrency = 40
+// also used as the default fan-out width for parallel page/post fetches. 40 was
+// the latency sweet spot but not a safe sustained rate: a ~40-minute comment-heavy
+// archive run at 40 earned an hour-long IP-level null-route from LJ, escalating
+// first through connection resets on comment pages. 30 keeps most of the
+// throughput and stays under that threshold; drop to ~10 for very long runs.
+// NewClient copies this into Client.HTTPConcurrency at construction time; call
+// Client.SetConcurrency to change the limit at runtime (direct field assignment
+// leaves the underlying Transport pool stale).
+var HTTPConcurrency = 30
 
 // BodyFormat values accepted by Client.BodyFormat. Empty string is treated as
 // FormatHTML. Unknown values warn-and-fall-through to FormatHTML at parse time.
@@ -102,7 +104,7 @@ type Client struct {
 }
 
 // NewClient returns a Client with default settings: 30s request timeout,
-// MaxConnsPerHost = HTTPConcurrency (package var, default 40), exponential
+// MaxConnsPerHost = HTTPConcurrency (package var, default 30), exponential
 // retry backoff starting at 1s capped at 8s. Set BodyFormat, ImagesDir,
 // Logger, SkipIDs on the returned value before the first request. To change
 // the concurrency cap after construction, call SetConcurrency — direct
